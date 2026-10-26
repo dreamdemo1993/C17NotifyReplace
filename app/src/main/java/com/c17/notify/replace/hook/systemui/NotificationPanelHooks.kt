@@ -1563,10 +1563,42 @@ internal class NotificationPanelHooks(
             if (groupIconTakeovers[icon] === this) groupIconTakeovers.remove(icon)
         }
 
+        /**
+         * Replaces this takeover with one bound to [latest] instead of dropping it.
+         *
+         * A configuration reload swaps the `RuntimeSnapshot` instance, so `isCurrent` turns false
+         * for every guard installed under the previous one — while the host's `GroupIconManager`
+         * coroutine keeps repainting the collapsed row. Stopping there handed the badge back to the
+         * raw app icon for the rest of the session; only a SystemUI restart (fresh rows, fresh
+         * guards) brought the theme icon back, which is the "first notification of a session keeps
+         * the original icon" report. A null plan under the new configuration means the row should
+         * yield now, so dropping the takeover is correct in that case.
+         */
+        fun rearmUnder(latest: RuntimeSnapshot) {
+            stop()
+            val currentSbn = runCatching { row?.let { statusBarNotificationFromRow(it) } }.getOrNull()
+                ?: return
+            if (currentSbn.key != sbn.key) return
+            val plan = runCatching {
+                latest.resolver.resolveGroupSummaryIconPlan(
+                    context = icon.context,
+                    sbn = currentSbn,
+                    originalSmallIcon = currentSbn.originalSmallIcon(diagnostics, latest.revision),
+                )
+            }.getOrNull() ?: return
+            writeGroupSummaryPlan(icon, plan)
+            keepGroupSummaryIcon(icon, row, currentSbn, latest) { writeGroupSummaryPlan(icon, plan) }
+            reportGroupSummaryAnchor(icon, row, currentSbn, "snapshotReload")
+        }
+
         override fun onPreDraw(): Boolean {
             if (stopped) return true
-            if (!icon.isAttachedToWindow || !configuration.isCurrent(snapshot)) {
+            if (!icon.isAttachedToWindow) {
                 stop()
+                return true
+            }
+            if (!configuration.isCurrent(snapshot)) {
+                rearmUnder(configuration.snapshot)
                 return true
             }
             val key = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }.getOrNull()
@@ -1912,8 +1944,16 @@ internal class NotificationPanelHooks(
          */
         override fun onPreDraw(): Boolean {
             if (stopped) return true
-            if (!icon.isAttachedToWindow || !configuration.isCurrent(snapshot)) {
+            if (!icon.isAttachedToWindow) {
                 stop()
+                return true
+            }
+            if (!configuration.isCurrent(snapshot)) {
+                // Same reload problem as IconTakeover.rearmUnder: this guard and the refill ladder it
+                // started both key off the old snapshot instance, so a reload killed the only net
+                // that catches a collapsed row the host painted blank. Re-install under the new one.
+                stop()
+                guardSummaryIconAgainstBlank(icon, row, sbn, configuration.snapshot)
                 return true
             }
             val key = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }.getOrNull()
