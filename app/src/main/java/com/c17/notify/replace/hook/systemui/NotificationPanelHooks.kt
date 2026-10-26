@@ -207,6 +207,11 @@ internal class NotificationPanelHooks(
         val layout = members.rowGetPublicLayout?.invoke(row) as? View ?: return false
         val sbn = statusBarNotificationFromRow(row) ?: return false
         val packageName = sbn.packageName
+        // A collapsed-group row composites its own badge from the app icon and never inflates a
+        // public layout that carries one, so the lookup below always failed there and produced a
+        // per-package warning that read like a real replacement failure. The group path has its
+        // own hooks; keep this one quiet for those rows.
+        if (sbn.key.contains("|g:")) return false
         try {
             val iconView = layout.findPublicIcon() ?: run {
                 diagnostics.report(
@@ -819,6 +824,8 @@ internal class NotificationPanelHooks(
             ) ?: return
             if (!configuration.isCurrent(snapshot)) return
             writeGroupSummaryPlan(iconView, plan)
+            reportGroupSummaryAnchor(iconView, row, sbn)
+            writeAlternateGroupBadge(iconView, row, sbn, snapshot, plan)
             if (verifyAfterWrite) {
                 // The guard re-writes the *resolved* plan, never a fresh lookup: the row's verdict
                 // can flip while the row lives (the host attaches the child avatar and the plan
@@ -851,6 +858,57 @@ internal class NotificationPanelHooks(
         plan.tintColor?.let { tint ->
             iconView.colorFilter = PorterDuffColorFilter(tint, PorterDuff.Mode.SRC_IN)
         }
+    }
+
+    /**
+     * Records which view the collapsed-group write actually landed on.
+     *
+     * ColorOS hands `attachCollapsedGroupBadge` a `CachingIconView`, but the badge the collapsed row
+     * paints is the one inside `oplus_notification_collapsed_group_header > icon_container > icon`.
+     * When those are two different instances the module keeps a perfectly themed drawable in a view
+     * nobody draws, the takeover guard reports "stable" because that view never changes again, and
+     * the row keeps the raw app icon on screen — which is the "two notifications from the same app,
+     * one replaced and one original" report. This line is what separates that from a host overwrite.
+     */
+    @SuppressLint("DiscouragedApi") // The ids belong to the hooked SystemUI APK, not this module.
+    private fun reportGroupSummaryAnchor(
+        iconView: ImageView,
+        row: Any?,
+        sbn: StatusBarNotification,
+    ) {
+        val rowView = row as? View ?: return
+        val idName = runCatching {
+            if (iconView.id == View.NO_ID) "no_id" else iconView.resources.getResourceEntryName(iconView.id)
+        }.getOrDefault("unknown")
+        val badge = rowView.findOplusGroupSummaryIcon()
+        diagnostics.report(
+            level = DiagnosticLevel.Debug,
+            event = DiagnosticEvent.PackageIconResolved,
+            message = "聚合徽标定位：${sbn.packageName} 写入 id=$idName " +
+                "size=${iconView.width}x${iconView.height} attached=${iconView.isAttachedToWindow} " +
+                "visible=${iconView.visibility == View.VISIBLE} 徽标命中=${badge != null} " +
+                "同实例=${badge === iconView}",
+            attributes = mapOf("package" to sbn.packageName, "key" to sbn.key),
+            occurrence = OccurrencePolicy.Once("panel:group_anchor:${sbn.key}"),
+        )
+    }
+
+    /**
+     * Writes the same plan into the badge the collapsed row actually paints, when that badge is not
+     * the view the host handed over. A no-op on hosts where both are the same instance.
+     */
+    private fun writeAlternateGroupBadge(
+        written: ImageView,
+        row: Any?,
+        sbn: StatusBarNotification,
+        snapshot: RuntimeSnapshot,
+        plan: NotificationIconResolver.PanelIconRenderPlan,
+    ) {
+        val rowView = row as? View ?: return
+        val badge = rowView.findOplusGroupSummaryIcon() ?: return
+        if (badge === written) return
+        writeGroupSummaryPlan(badge, plan)
+        keepGroupSummaryIcon(badge, row, sbn, snapshot) { writeGroupSummaryPlan(badge, plan) }
     }
 
     /** Same race as [verifyIconAfterWrite], for the badge handed over by `attachCollapsedGroupBadge`. */
@@ -1331,6 +1389,10 @@ internal class NotificationPanelHooks(
             }
 
             icon.applyRenderPlan(plan, target)
+            if (target == PanelIconTarget.OplusGroupSummary) {
+                reportGroupSummaryAnchor(icon, row, sbn)
+                writeAlternateGroupBadge(icon, row, sbn, snapshot, plan)
+            }
             if (target == PanelIconTarget.Header) {
                 icon.drawable?.let { drawable -> headerIconClaims.claim(icon, sbn.key, drawable) }
             }
@@ -2115,10 +2177,14 @@ internal class NotificationPanelHooks(
         val headerId = systemUiId("oplus_notification_collapsed_group_header")
         val containerId = systemUiId("icon_container")
         val iconId = systemUiId("icon")
-        if (headerId == 0 || containerId == 0 || iconId == 0) return null
-        val header = findViewById<View>(headerId) as? ViewGroup ?: return null
-        val container = header.findViewById<View>(containerId) as? ViewGroup ?: header
-        return container.findViewById<View>(iconId) as? ImageView
+        if (containerId == 0 || iconId == 0) return null
+        val header = headerId.takeIf { it != 0 }?.let { findViewById<View>(it) }
+        // ColorOS 17 drops the collapsed-group header id on some builds; the badge then lives in the
+        // row's own icon container. Falling back to it keeps the takeover pointed at a view that is
+        // actually drawn instead of silently returning null.
+        val container = header?.findViewById<View>(containerId) as? ViewGroup
+            ?: findViewById<View>(containerId) as? ViewGroup
+        return (container ?: header)?.findViewById<View>(iconId) as? ImageView
     }
 
     @SuppressLint("DiscouragedApi") // These resources belong to the hooked SystemUI APK, not this module.
