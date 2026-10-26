@@ -82,7 +82,7 @@ internal class LockScreenCapsuleHooks(
         hooks.install(method, "systemui.lockscreen.capsule.getRoundedIcon") { chain ->
             if (!lockScreenCapsuleEnabled()) return@install chain.proceed()
             val iconData = chain.args.getOrNull(0) ?: return@install chain.proceed()
-            val context = (chain.thisObject as? View)?.context ?: return@install chain.proceed()
+            val context = (chain.instanceOrNull as? View)?.context ?: return@install chain.proceed()
             try {
                 patchNotificationIconData(
                     context = context,
@@ -130,7 +130,7 @@ internal class LockScreenCapsuleHooks(
             hooks.install(method, "systemui.lockscreen.capsule.card_bind") { chain ->
                 if (!lockScreenCapsuleEnabled()) return@install chain.proceed()
                 val innerData = chain.args.getOrNull(0) ?: return@install chain.proceed()
-                val card = chain.thisObject ?: return@install chain.proceed()
+                val card = chain.instanceOrNull ?: return@install chain.proceed()
                 chain.proceed()
                 scheduleAggregateGlyphRefresh(card, innerData)
             }

@@ -76,7 +76,7 @@ internal class NotificationPanelHooks(
         members.headerOnContentUpdated?.let { method ->
             hooks.install(method, "systemui.panel.header.onContentUpdated") { chain ->
                 val result = chain.proceed()
-                chain.thisObject?.let { wrapper ->
+                chain.instanceOrNull?.let { wrapper ->
                     applyPanelIcon(wrapper, rowCandidate = chain.args.firstOrNull())
                 }
                 result
@@ -85,7 +85,7 @@ internal class NotificationPanelHooks(
         members.headerResolveHeaderViews?.let { method ->
             hooks.install(method, "systemui.panel.header.resolveHeaderViews") { chain ->
                 val result = chain.proceed()
-                chain.thisObject?.let { wrapper -> applyPanelIcon(wrapper) }
+                chain.instanceOrNull?.let { wrapper -> applyPanelIcon(wrapper) }
                 result
             }
         }
@@ -98,7 +98,7 @@ internal class NotificationPanelHooks(
                 // the previous row kept that raw look forever when no content update followed (the
                 // weather "special focus" alert grouped under a newer weather post). Re-apply now
                 // and once more after a short delay, because the host can compose asynchronously.
-                chain.thisObject?.let { wrapper ->
+                chain.instanceOrNull?.let { wrapper ->
                     applyPanelIcon(wrapper)
                     if (chain.args.firstOrNull() == true) {
                         runCatching { members.notificationViewWrapperRow.get(wrapper) }.getOrNull()
@@ -117,7 +117,7 @@ internal class NotificationPanelHooks(
         members.oplusGroupInitIcon?.let { method ->
             hooks.install(method, "systemui.panel.group.initIcon") { chain ->
                 val result = chain.proceed()
-                chain.thisObject?.let { wrapper ->
+                chain.instanceOrNull?.let { wrapper ->
                     applyPanelIcon(wrapper, target = PanelIconTarget.OplusGroupSummary)
                 }
                 result
@@ -126,7 +126,7 @@ internal class NotificationPanelHooks(
         members.oplusGroupResolveHeaderViews?.let { method ->
             hooks.install(method, "systemui.panel.group.resolveHeaderViews") { chain ->
                 val result = chain.proceed()
-                chain.thisObject?.let { wrapper ->
+                chain.instanceOrNull?.let { wrapper ->
                     applyPanelIcon(wrapper, target = PanelIconTarget.OplusGroupSummary)
                 }
                 result
@@ -137,7 +137,7 @@ internal class NotificationPanelHooks(
         members.oplusGroupFlushIcon?.let { method ->
             hooks.install(method, "systemui.panel.group.flushIcon") { chain ->
                 val result = chain.proceed()
-                chain.thisObject?.let { wrapper ->
+                chain.instanceOrNull?.let { wrapper ->
                     applyPanelIcon(wrapper, target = PanelIconTarget.OplusGroupSummary)
                 }
                 result
@@ -175,7 +175,7 @@ internal class NotificationPanelHooks(
         val setHideSensitive = members.rowSetHideSensitive ?: return
         hooks.install(setHideSensitive, "systemui.panel.row.setHideSensitive") { chain ->
             val result = chain.proceed()
-            chain.thisObject?.let { row ->
+            chain.instanceOrNull?.let { row ->
                 // The public layout is (re)inflated right after this call, so run once now and
                 // again after the next frames — the icon may not exist on the first pass yet.
                 applyHiddenContentIcon(row)
@@ -279,7 +279,7 @@ internal class NotificationPanelHooks(
             if (!snapshot.resolver.panelThemeIconsEnabled()) return@install chain.proceed()
             val sbn = chain.args.firstOrNull { it is StatusBarNotification } as? StatusBarNotification
                 ?: return@install chain.proceed()
-            val context = resolverContext(resolver, chain.thisObject) ?: return@install chain.proceed()
+            val context = resolverContext(resolver, chain.instanceOrNull) ?: return@install chain.proceed()
             val packageName = sbn.packageName
             val replacement = try {
                 snapshot.resolver.resolvePanelThemeDrawable(context, sbn)
@@ -457,7 +457,7 @@ internal class NotificationPanelHooks(
             val rawArgument = chain.args.firstOrNull { it is String } as? String
                 ?: return@install chain.proceed()
             val packageName = packageNameFromArgument(rawArgument)
-            val context = resolverContext(resolver, chain.thisObject) ?: return@install chain.proceed()
+            val context = resolverContext(resolver, chain.instanceOrNull) ?: return@install chain.proceed()
             val replacement = snapshot.resolver.resolveThemeDrawableByPackage(context, packageName)
             if (replacement == null) {
                 diagnostics.report(
@@ -515,7 +515,7 @@ internal class NotificationPanelHooks(
             if (!snapshot.config.panelIconReplacementEnabled) return@install chain.proceed()
             if (!snapshot.resolver.panelThemeIconsEnabled()) return@install chain.proceed()
             val rowSbn = headerBadgeRow.get()
-            val rowContext = resolverContext(resolver, chain.thisObject)
+            val rowContext = resolverContext(resolver, chain.instanceOrNull)
             val rawArgument = chain.args.firstOrNull { it is String } as? String
             val packageName = rowSbn?.packageName
                 ?: rawArgument?.let(::packageNameFromArgument)
@@ -545,7 +545,7 @@ internal class NotificationPanelHooks(
                     val stalePlaceholder = hostedDrawable != null &&
                         HostAvatarPresence.looksLikeLauncherIcon(context, packageName, hostedDrawable)
                     if (themedHere || stalePlaceholder) {
-                        evictHeaderIconBadge(resolver, chain.thisObject, rawArgument)
+                        evictHeaderIconBadge(resolver, chain.instanceOrNull, rawArgument)
                         themedBadgeRows.remove(rowSbn.key)
                         diagnostics.report(
                             level = DiagnosticLevel.Info,
@@ -1093,7 +1093,7 @@ internal class NotificationPanelHooks(
         val method = oplusHeader.applyExpandedCanvasIconWithBadge ?: return
         hooks.install(method, "systemui.panel.header.applyExpandedCanvasIconWithBadge") { chain ->
             val result = chain.proceed()
-            chain.thisObject?.let { extension ->
+            chain.instanceOrNull?.let { extension ->
                 try {
                     oplusHeader.getBase.invoke(extension)?.let { wrapper ->
                         applyPanelIcon(wrapper, target = wrapper.iconTarget)
@@ -1124,7 +1124,7 @@ internal class NotificationPanelHooks(
         val method = oplusHeader.proxyOnContentUpdated ?: return
         hooks.install(method, "systemui.panel.header.proxyOnContentUpdated") { chain ->
             val result = chain.proceed()
-            chain.thisObject?.let { extension ->
+            chain.instanceOrNull?.let { extension ->
                 try {
                     oplusHeader.getBase.invoke(extension)?.let { wrapper ->
                         applyPanelIcon(wrapper)
@@ -1148,7 +1148,7 @@ internal class NotificationPanelHooks(
         hooks.install(method, "systemui.panel.header.updateIconColor") { chain ->
             val snapshot = configuration.snapshot
             if (!snapshot.config.panelIconReplacementEnabled) return@install chain.proceed()
-            val extension = chain.thisObject ?: return@install chain.proceed()
+            val extension = chain.instanceOrNull ?: return@install chain.proceed()
             val wrapper = try {
                 oplusHeader.getBase.invoke(extension)
             } catch (exception: Exception) {
@@ -1206,7 +1206,7 @@ internal class NotificationPanelHooks(
     private fun installOplusHeaderRoundnessReapply(oplusHeader: OplusHeaderMembers) {
         val method = oplusHeader.updateIconRoundness ?: return
         hooks.install(method, "systemui.panel.header.updateIconRoundness") { chain ->
-            val extension = chain.thisObject
+            val extension = chain.instanceOrNull
             val wrapper = extension?.let { instance ->
                 try {
                     oplusHeader.getBase.invoke(instance)

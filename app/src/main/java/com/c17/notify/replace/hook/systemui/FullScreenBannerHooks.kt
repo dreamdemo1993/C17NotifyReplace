@@ -49,7 +49,7 @@ internal class FullScreenBannerHooks(
             val entry = chain.args.getOrNull(0)
             if (entry != null) lastEntry = entry
             val result = chain.proceed()
-            val helper = chain.thisObject
+            val helper = chain.instanceOrNull
             val context = members.helperContext?.get(helper) as? Context
             val banner = members.helperFullScreenBanner?.get(helper)
             if (context != null && entry != null && banner != null) {
@@ -66,7 +66,7 @@ internal class FullScreenBannerHooks(
             if (entry != null) lastEntry = entry
             val builder = chain.proceed()
             val context = chain.args.getOrNull(0) as? Context
-                ?: members.helperContext?.get(chain.thisObject) as? Context
+                ?: members.helperContext?.get(chain.instanceOrNull) as? Context
             if (builder != null && context != null && entry != null) {
                 patchBuilderIcon(context, builder, entry)
             }
@@ -77,7 +77,7 @@ internal class FullScreenBannerHooks(
     private fun installUpdateBannerHook() {
         val method = members.updateBanner ?: return
         hooks.install(method, "systemui.fullscreen_banner.updateBanner") { chain ->
-            val banner = chain.thisObject ?: return@install chain.proceed()
+            val banner = chain.instanceOrNull ?: return@install chain.proceed()
             val builder = chain.args.getOrNull(0)
             val context = bannerContext(banner)
             val entry = resolveEntry(banner)
@@ -99,7 +99,7 @@ internal class FullScreenBannerHooks(
     private fun installSetIconHook() {
         val method = members.bannerSetIcon ?: return
         hooks.install(method, "systemui.fullscreen_banner.setIcon") { chain ->
-            val banner = chain.thisObject ?: return@install chain.proceed()
+            val banner = chain.instanceOrNull ?: return@install chain.proceed()
             val context = bannerContext(banner)
             val entry = resolveEntry(banner)
             val plan = if (context != null && entry != null) {
@@ -145,7 +145,7 @@ internal class FullScreenBannerHooks(
     private fun installBackgroundIconHook() {
         val method = members.backgroundSetIcon ?: return
         hooks.install(method, "systemui.fullscreen_banner.background.setIcon") { chain ->
-            val context = (chain.thisObject as? View)?.context
+            val context = (chain.instanceOrNull as? View)?.context
             val entry = lastEntry ?: return@install chain.proceed()
             val plan = context?.let { resolvePanelPlan(it, entry) }
             // Chain.getArgs() is immutable; pass the replacement through proceed().

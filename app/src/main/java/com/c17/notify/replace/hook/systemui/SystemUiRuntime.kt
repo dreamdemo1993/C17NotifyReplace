@@ -1,5 +1,6 @@
 package com.c17.notify.replace.hook.systemui
 
+import android.content.SharedPreferences
 import android.service.notification.StatusBarNotification
 import com.c17.notify.replace.diagnostics.Diagnostics
 import com.c17.notify.replace.hook.HookRegistrar
@@ -8,11 +9,12 @@ import com.c17.notify.replace.hook.icon.ThemeIconProvider
 import com.c17.notify.replace.hook.installationFailure
 import com.c17.notify.replace.hook.memberMissing
 import com.c17.notify.replace.hook.runtimeFailure
-import io.github.libxposed.api.XposedInterface
+import com.highcapable.yukihookapi.hook.xposed.file.YukiHookSharedFiles
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 
 internal class SystemUiRuntime(
-    private val xposed: XposedInterface,
+    private val openConfigPreferences: () -> SharedPreferences,
+    private val sharedFiles: YukiHookSharedFiles,
     private val hooks: HookRegistrar,
     private val diagnostics: Diagnostics,
     private val processName: String,
@@ -30,7 +32,8 @@ internal class SystemUiRuntime(
         val iconConfiguration = OplusIconConfigurationReader(diagnostics)
         val themeIcons = ThemeIconProvider(diagnostics, iconConfiguration)
         val configuration = SystemUiConfiguration(
-            xposed = xposed,
+            openConfigPreferences = openConfigPreferences,
+            sharedFiles = sharedFiles,
             diagnostics = diagnostics,
             processName = processName,
             themeIcons = themeIcons,
@@ -74,7 +77,7 @@ internal class SystemUiRuntime(
                     entryMembers.predicate,
                     "systemui.useAppIconForSmallIcon.entry",
                 ) { chain ->
-                    val extension = chain.thisObject ?: return@install chain.proceed()
+                    val extension = chain.instanceOrNull ?: return@install chain.proceed()
                     val currentResult = try {
                         val entry = entryMembers.getBase.invoke(extension)
                         val sbn = entry?.let {

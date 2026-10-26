@@ -1,5 +1,8 @@
 package com.c17.notify.replace.hook
 
+import android.content.SharedPreferences
+import com.c17.notify.replace.BuildConfig
+import com.c17.notify.replace.core.ModuleInfo
 import com.c17.notify.replace.core.SystemPackages
 import com.c17.notify.replace.diagnostics.DiagnosticEvent
 import com.c17.notify.replace.diagnostics.DiagnosticLevel
@@ -8,127 +11,116 @@ import com.c17.notify.replace.diagnostics.OccurrencePolicy
 import com.c17.notify.replace.hook.games.GameAssistantRuntime
 import com.c17.notify.replace.hook.systemserver.SystemServerHooks
 import com.c17.notify.replace.hook.systemui.SystemUiRuntime
-import io.github.libxposed.api.XposedModule
-import io.github.libxposed.api.XposedModuleInterface.HotReloadingParam
-import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
-import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
-import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam
+import com.c17.notify.replace.rules.RuleStore
+import com.highcapable.yukihookapi.YukiHook
+import com.highcapable.yukihookapi.annotation.xposed.YukiHookLibXposedEntry
+import com.highcapable.yukihookapi.hook.param.PackageParam
+import com.highcapable.yukihookapi.hook.xposed.YukiHookXposedModule
+import com.highcapable.yukihookapi.hook.xposed.bridge.event.registerFrameworkEvents
+import com.highcapable.yukihookapi.hook.xposed.bridge.event.v101.onModuleLoaded
 
-class ModuleMain : XposedModule() {
+@YukiHookLibXposedEntry(
+    minApiVersion = 102,
+    targetApiVersion = 102,
+    scope = ["system", SystemPackages.SYSTEM_UI, SystemPackages.GAME_ASSISTANT],
+    staticScope = true,
+)
+object ModuleMain : YukiHookXposedModule {
 
-    private lateinit var target: ProcessTarget
+    private var target = ProcessTarget.Ignore
+    private var installed = false
     private lateinit var processName: String
     private lateinit var diagnostics: Diagnostics
-    private lateinit var hooks: HookRegistrar
+    private lateinit var openConfigPreferences: () -> SharedPreferences
 
-    override fun onModuleLoaded(param: ModuleLoadedParam) {
-        processName = param.processName
-        diagnostics = Diagnostics(XposedDiagnosticSink(this, processName))
-        hooks = HookRegistrar(this, diagnostics, processName)
-        target = resolveProcessTarget(param.isSystemServer, processName)
+    override fun onInit() {
+        YukiHook.configure {
+            debug = BuildConfig.DEBUG
+            dataChannel = false
+            logging { tag = ModuleInfo.LOG_TAG }
+        }
+        registerFrameworkEvents {
+            onModuleLoaded { param ->
+                processName = param.processName
+                target = resolveProcessTarget(param.isSystemServer, param.processName)
+                diagnostics = Diagnostics(YukiHookDiagnosticSink(processName))
+                // Native SharedPreferences keeps the revision listener our publish protocol relies
+                // on, so the factory stays on the framework API instead of the generic wrapper.
+                openConfigPreferences = { getRemotePreferences(RuleStore.GROUP_CONFIG) }
 
-        diagnostics.report(
-            level = DiagnosticLevel.Info,
-            event = DiagnosticEvent.ModuleLoaded,
-            message = "模块入口已路由",
-            attributes = mapOf(
-                "api" to apiVersion,
-                "framework" to frameworkName,
-                "target" to target.diagnosticName,
-            ),
-            occurrence = OccurrencePolicy.Once(processName),
-        )
-        if (target == ProcessTarget.Ignore) {
-            diagnostics.debug(
-                event = DiagnosticEvent.ProcessIgnored,
-                message = "当前进程不承载任何模块功能",
-                attributes = emptyMap(),
-                occurrence = OccurrencePolicy.Once(processName),
-            )
-            detach()
+                diagnostics.report(
+                    level = DiagnosticLevel.Info,
+                    event = DiagnosticEvent.ModuleLoaded,
+                    message = "模块入口已路由",
+                    attributes = mapOf(
+                        "api" to YukiHook.Status.Executor.apiVersion,
+                        "framework" to YukiHook.Status.Executor.name,
+                        "target" to target.diagnosticName,
+                    ),
+                    occurrence = OccurrencePolicy.Once(processName),
+                )
+                if (target == ProcessTarget.Ignore) {
+                    diagnostics.debug(
+                        event = DiagnosticEvent.ProcessIgnored,
+                        message = "当前进程不承载任何模块功能",
+                        attributes = emptyMap(),
+                        occurrence = OccurrencePolicy.Once(processName),
+                    )
+                }
+            }
         }
     }
 
-    override fun onSystemServerStarting(param: SystemServerStartingParam) {
-        if (target != ProcessTarget.SystemServer) return
+    override fun onHook() = YukiHook.encase {
+        loadSystem {
+            if (target == ProcessTarget.SystemServer) installTarget()
+        }
+        loadApp(SystemPackages.SYSTEM_UI) {
+            if (target == ProcessTarget.SystemUiMain && isFirstApplication) installTarget()
+        }
+        loadApp(SystemPackages.GAME_ASSISTANT) {
+            if (target == ProcessTarget.GameAssistant && isFirstApplication) installTarget()
+        }
+    }
+
+    private fun PackageParam.installTarget() {
+        if (installed) return
+        installed = true
         try {
-            SystemServerHooks(
-                hooks = hooks,
-                diagnostics = diagnostics,
-            ).install(param.classLoader)
+            val loader = requireNotNull(hostClassLoader) { "Host ClassLoader is unavailable" }
+            val hooks = HookRegistrar(this, diagnostics, processName)
+            when (target) {
+                ProcessTarget.SystemServer -> SystemServerHooks(
+                    hooks = hooks,
+                    diagnostics = diagnostics,
+                ).install(loader)
+
+                ProcessTarget.SystemUiMain -> SystemUiRuntime(
+                    openConfigPreferences = openConfigPreferences,
+                    sharedFiles = sharedFiles,
+                    hooks = hooks,
+                    diagnostics = diagnostics,
+                    processName = processName,
+                ).install(loader)
+
+                ProcessTarget.GameAssistant -> GameAssistantRuntime(
+                    hooks = hooks,
+                    diagnostics = diagnostics,
+                    processName = processName,
+                ).install(loader)
+
+                ProcessTarget.Ignore -> Unit
+            }
         } catch (exception: Exception) {
             diagnostics.installationFailure(
-                scope = "system_server:initialize",
-                message = "system_server 功能初始化失败",
+                scope = "${target.diagnosticName}:initialize",
+                message = "进程 Hook 初始化失败：${target.diagnosticName}",
                 cause = exception,
             )
         }
-        detachAfterInitialization()
+        // The generated entry owns lifecycle dispatch. Hot reload stays disabled (the default):
+        // our hooks, config listeners and delayed UI work have a process lifetime.
     }
-
-    override fun onPackageReady(param: PackageReadyParam) {
-        when (target) {
-            ProcessTarget.SystemUiMain -> installSystemUi(param)
-            ProcessTarget.GameAssistant -> installGameAssistant(param)
-            else -> Unit
-        }
-    }
-
-    private fun installSystemUi(param: PackageReadyParam) {
-        if (param.packageName != SystemPackages.SYSTEM_UI || !param.isFirstPackage) return
-
-        try {
-            SystemUiRuntime(
-                xposed = this,
-                hooks = hooks,
-                diagnostics = diagnostics,
-                processName = processName,
-            ).install(param.classLoader)
-        } catch (exception: Exception) {
-            diagnostics.installationFailure(
-                scope = "systemui:initialize",
-                message = "SystemUI 运行时初始化失败",
-                cause = exception,
-            )
-        }
-        detachAfterInitialization()
-    }
-
-    private fun installGameAssistant(param: PackageReadyParam) {
-        if (param.packageName != SystemPackages.GAME_ASSISTANT || !param.isFirstPackage) return
-
-        try {
-            GameAssistantRuntime(
-                hooks = hooks,
-                diagnostics = diagnostics,
-                processName = processName,
-            ).install(param.classLoader)
-        } catch (exception: Exception) {
-            diagnostics.installationFailure(
-                scope = "games:initialize",
-                message = "游戏助手主题图标初始化失败",
-                cause = exception,
-            )
-        }
-        detachAfterInitialization()
-    }
-
-    /**
-     * Installed hooks, preference callbacks and delayed UI work have an explicit process lifetime.
-     * A partial generation swap cannot safely retire them, so hot reload remains unsupported.
-     */
-    override fun onHotReloading(param: HotReloadingParam): Boolean = false
-
-    private fun detachAfterInitialization() {
-        diagnostics.debug(
-            event = DiagnosticEvent.LifecycleDetached,
-            message = "初始化完成，停止接收后续生命周期回调",
-            attributes = emptyMap(),
-            occurrence = OccurrencePolicy.Once("initialized:$processName"),
-        )
-        detach()
-    }
-
 }
 
 internal enum class ProcessTarget(val diagnosticName: String) {

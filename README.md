@@ -9,14 +9,22 @@
 | 项目 / 英文名 | `C17NotifyReplace` |
 | 桌面显示名 | `C17 通知替换` |
 | 应用 ID / namespace | `com.c17.notify.replace` |
-| Xposed 入口 | `com.c17.notify.replace.hook.ModuleMain` |
+| Xposed 入口（注解声明） | `com.c17.notify.replace.hook.ModuleMain` |
+| Xposed 入口（KSP 生成） | `com.c17.notify.replace.hook.ModuleMain_YukiHookXposedInit` |
 | 日志 TAG / 线程名 | `C17NotifyReplace` |
 | CI 产物名 | `C17NotifyReplace-<version>.apk` |
 
 ## 上游来源
 
 - [fankes/ColorOSNotifyIcon](https://github.com/fankes/ColorOSNotifyIcon)：原项目，版权归 Fankes Studio 所有
-- [Mangi-11/Glyph](https://github.com/Mangi-11/Glyph)：基于原项目，用 libxposed API 102 重写 Hook 层、用 Miuix 重写 UI 的分支，本仓库的直接上游
+- [Mangi-11/Glyph](https://github.com/Mangi-11/Glyph)：基于原项目，用 YukiHook（libxposed API 102 底座）与 KavaRef 重写 Hook 层、用 Miuix 重写 UI 的分支，本仓库的直接上游
+
+## 技术栈
+
+- Hook 框架：YukiHook 1.5.0（`yukihook-runtime-libxposed`，libxposed API 102 底座）
+- 反射：KavaRef 1.1.1
+- 模块入口与 `module.prop` / `scope.list` / `java_init.list` 由 KSP 在编译期生成，不再手写 `META-INF/xposed` 资源
+- UI：Jetpack Compose + Miuix 0.9.4
 - [robojamu/Glyph](https://github.com/robojamu/Glyph)：基于该项目，把状态栏图标改为规则图标、下拉栏使用主题图标，并加入锁屏与锁屏岛图标替换；本仓库以该分支最新 release `3.4.5-cn` 为源码基线。
 - [Android Notification Icon Project](https://github.com/BetterAndroid/android-notification-icon-project)：通知图标规则库，规则由该项目维护
 

@@ -17,8 +17,7 @@ import com.c17.notify.replace.rules.RuleCatalog
 import com.c17.notify.replace.rules.RulePayloadIO
 import com.c17.notify.replace.rules.RuleStore
 import com.c17.notify.replace.rules.VersionedRuleFiles
-import io.github.libxposed.api.XposedInterface
-import java.io.FileInputStream
+import com.highcapable.yukihookapi.hook.xposed.file.YukiHookSharedFiles
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
@@ -39,7 +38,8 @@ internal class RuntimeSnapshot(
 )
 
 internal class SystemUiConfiguration(
-    private val xposed: XposedInterface,
+    private val openConfigPreferences: () -> SharedPreferences,
+    private val sharedFiles: YukiHookSharedFiles,
     private val diagnostics: Diagnostics,
     private val processName: String,
     private val themeIcons: ThemeIconProvider,
@@ -292,12 +292,10 @@ internal class SystemUiConfiguration(
     )
 
     private fun readRemoteFile(name: String): String =
-        xposed.openRemoteFile(name).use { descriptor ->
-            FileInputStream(descriptor.fileDescriptor).use { RulePayloadIO.readUtf8(it) }
-        }
+        sharedFiles.inputStream(name).use { RulePayloadIO.readUtf8(it) }
 
     private fun openRemotePreferences(): SharedPreferences? = try {
-        xposed.getRemotePreferences(RuleStore.GROUP_CONFIG)
+        openConfigPreferences()
     } catch (exception: Exception) {
         reportLoadFailure(
             scope = "preferences",

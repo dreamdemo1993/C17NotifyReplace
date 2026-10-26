@@ -113,7 +113,7 @@ internal class GameAssistantRuntime(
             return
         }
         hooks.install(method, "games.launcher_icon") { chain ->
-            val item = chain.thisObject
+            val item = chain.instanceOrNull
             // Only application-level icons: a service or permission entry has no themed artwork and
             // resolving one would just cost a lookup.
             val appLevel = item is ApplicationInfo || item is ActivityInfo
@@ -173,7 +173,7 @@ internal class GameAssistantRuntime(
             val result = chain.proceed()
             runCatching {
                 val packageName = packageFromModel(chain.args.getOrNull(0))
-                val icon = iconGetter?.invoke(chain.thisObject) as? ImageView
+                val icon = iconGetter?.invoke(chain.instanceOrNull) as? ImageView
                 val themed = packageName?.let { replacer.drawableFor(SITE_EDGE_PANEL, it) }
                 if (icon != null && themed != null) {
                     GameIconTakeovers.take(icon, themed)

@@ -97,7 +97,7 @@ internal class AodNotificationHooks(
         hooks.install(method, "systemui.aod.updateNotificationView") { chain ->
             val sbn = chain.args.getOrNull(0) as? StatusBarNotification
                 ?: return@install chain.proceed()
-            val layout = chain.thisObject ?: return@install chain.proceed()
+            val layout = chain.instanceOrNull ?: return@install chain.proceed()
             val context = layoutContext.get(layout) as? Context
                 ?: return@install chain.proceed()
             val replacement = resolveReplacementIcon(context, sbn.key, sbn.packageName, sbn)
