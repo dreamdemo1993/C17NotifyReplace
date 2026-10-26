@@ -40,7 +40,7 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          ./gradlew :app:testDebugUnitTest :app:lintRelease :app:assembleDebug :app:assembleRelease 2>&1 | tee build.log
+          ./gradlew :app:testDebugUnitTest :app:lintRelease :app:assembleRelease 2>&1 | tee build.log
 
       # The run logs need authentication to read, the commit's check runs do not. When the build
       # breaks, publish the compiler errors there so they can be read without a token.
@@ -70,43 +70,31 @@ jobs:
         if: steps.build.outcome == 'failure'
         run: exit 1
 
-      - name: Name snapshot artifacts
+      - name: Name the release artifact
         shell: bash
         run: |
           set -euo pipefail
           version_name=$(sed -nE 's/^project\.app\.versionName="?([^"[:space:]]+)"?$/\1/p' gradle.properties)
           short_sha=${GITHUB_SHA:0:7}
-          debug_source=$(find "${APK_OUTPUT_PATH}/debug" -maxdepth 1 -type f -name '*.apk' -print -quit)
-          snapshot_source=$(find "${APK_OUTPUT_PATH}/release" -maxdepth 1 -type f -name '*.apk' -print -quit)
+          apk_source=$(find "${APK_OUTPUT_PATH}/release" -maxdepth 1 -type f -name '*.apk' -print -quit)
           test -n "$version_name"
-          test -n "$debug_source"
-          test -n "$snapshot_source"
-          debug_target="${RUNNER_TEMP}/C17NotifyReplace-${version_name}-debug-${short_sha}.apk"
-          snapshot_target="${RUNNER_TEMP}/C17NotifyReplace-${version_name}-snapshot-${short_sha}.apk"
-          install -m 0644 "$debug_source" "$debug_target"
-          install -m 0644 "$snapshot_source" "$snapshot_target"
-          echo "DEBUG_APK_PATH=$debug_target" >> "$GITHUB_ENV"
-          echo "SNAPSHOT_APK_PATH=$snapshot_target" >> "$GITHUB_ENV"
+          test -n "$apk_source"
+          apk_target="${RUNNER_TEMP}/C17NotifyReplace-${version_name}-${short_sha}.apk"
+          install -m 0644 "$apk_source" "$apk_target"
+          echo "APK_PATH=$apk_target" >> "$GITHUB_ENV"
 
-      - name: Upload Artifacts (Debug)
+      - name: Upload APK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          path: ${{ env.DEBUG_APK_PATH }}
-          name: C17NotifyReplace-debug-${{ github.sha }}
+          path: ${{ env.APK_PATH }}
+          name: C17NotifyReplace-${{ github.sha }}
           if-no-files-found: error
 
-      - name: Upload Artifacts (Snapshot)
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          path: ${{ env.SNAPSHOT_APK_PATH }}
-          name: C17NotifyReplace-snapshot-${{ github.sha }}
-          if-no-files-found: error
-
-      - name: Upload Snapshot Mapping
+      - name: Upload ProGuard mapping
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           path: app/build/outputs/mapping/release/mapping.txt
-          name: C17NotifyReplace-snapshot-mapping-${{ github.sha }}
+          name: C17NotifyReplace-mapping-${{ github.sha }}
           if-no-files-found: error
 
       - name: Post Artifacts to Telegram
@@ -119,22 +107,12 @@ jobs:
           if [[ -z "${TG_BOT_TOKEN}" || -z "${TG_CHAT_ID}" ]]; then
             exit 0
           fi
-          media=$(env -u TG_BOT_TOKEN -u TG_CHAT_ID python3 - <<'PY'
-          import json
-          import os
-
-          message = os.environ["COMMIT_MESSAGE"]
-          if len(message) > 1024:
-              message = os.environ["COMMIT_URL"]
-          print(json.dumps([
-              {"type": "document", "media": "attach://debug"},
-              {"type": "document", "media": "attach://snapshot", "caption": message},
-          ]))
-          PY
-          )
+          message="${COMMIT_MESSAGE}"
+          if [[ ${#message} -gt 900 ]]; then
+            message="${COMMIT_URL}"
+          fi
           curl --fail-with-body --silent --show-error \
-            "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMediaGroup" \
+            "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
             --form-string "chat_id=${TG_CHAT_ID}" \
-            --form-string "media=${media}" \
-            --form "debug=@${DEBUG_APK_PATH}" \
-            --form "snapshot=@${SNAPSHOT_APK_PATH}"
+            --form-string "caption=${message}" \
+            --form "document=@${APK_PATH}"

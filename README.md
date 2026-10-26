@@ -53,6 +53,17 @@ App 内「关于 → 检查更新」读取本仓库的 Releases。
 
 规则图标单独同步：首页「更新规则」按钮拉取ANIP清单，无后台自动同步；补充规则应向 ANIP 提交。
 
+## 发版
+
+推一个版本号 tag（形如 `re.5`）即触发 `.github/workflows/self_release.yml`：Actions 用仓库内
+`.secret/universal.p12` 签名编译，产出单个 `C17NotifyReplace.apk` 与同名 `.sha256` 发布到 Releases。
+该证书与设备上已装的包一致，`adb install -r` 可直接覆盖升级，规则包与配置都不会丢。
+
+日常提交走 `.github/workflows/commit_ci.yml`，只产出一个 release APK（另附 ProGuard mapping），
+签名与正式包相同但版本不带 tag，用于装到手机上看效果。
+
+改动的是 hook 代码时，装完需要重启一次 SystemUI 才会生效。
+
 ## 注意事项
 
 1. 本软件免费、兴趣驱动，仅供学习交流；付费获取的版本均非官方渠道。
