@@ -113,6 +113,21 @@ internal class SystemUiRuntime(
             }
         }
 
+        // Must come after "refresh": the theme switch only decides *when* to rebind, the bridge
+        // above owns *how*. A missing bridge leaves the flag observed but the rows untouched.
+        installFeature("theme_change") {
+            SystemUiMembers.resolveThemeChange(classLoader, diagnostics)?.let { members ->
+                ThemeChangeRefreshHooks(
+                    hooks = hooks,
+                    diagnostics = diagnostics,
+                    configuration = configuration,
+                    themeIcons = themeIcons,
+                    members = members,
+                    refreshViews = { revision -> refreshBridge?.refresh(revision) },
+                ).install()
+            }
+        }
+
         installFeature("panel") {
             SystemUiMembers.resolvePanel(classLoader, diagnostics)?.let { members ->
                 NotificationPanelHooks(

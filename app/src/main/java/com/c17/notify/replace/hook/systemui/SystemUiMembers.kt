@@ -107,6 +107,17 @@ internal data class RefreshMembers(
     val refreshNotifications: Method?,
 )
 
+/**
+ * ColorOS 应用配置资源的统一入口。
+ *
+ * 主题、桌面图标样式这一类变化只写在 `OplusExtraConfiguration` 的扩展字段里，公开的
+ * [android.content.res.Configuration] 没有差异时 `android.app.ConfigurationController` 不会
+ * 回调 SystemUI，所以只能在 ColorOS 自己的应用路径上观察标志位。
+ */
+internal data class ThemeChangeMembers(
+    val applyConfigurationToResources: Method,
+)
+
 internal data class EntryUseAppIconMembers(
     val predicate: Method,
     val getBase: Method,
@@ -769,8 +780,38 @@ internal object SystemUiMembers {
         )
     }
 
-    fun resolveUseAppIcon(classLoader: ClassLoader): Method? {
-        val clazz = loadOptional(OPLUS_SMALL_ICON_UTIL, classLoader) ?: return null
+    /**
+     * `oplus.android.OplusCommonInjector.applyConfigurationToResourcesForResourcesManager(Configuration, int)`
+     * — every ColorOS process funnels resource application through it, `int` being the changed flags.
+     */
+    fun resolveThemeChange(
+        classLoader: ClassLoader,
+        diagnostics: Diagnostics,
+    ): ThemeChangeMembers? {
+        val injector = loadOptional(OPLUS_COMMON_INJECTOR, classLoader) ?: run {
+            diagnostics.memberMissing(
+                scope = "systemui:theme_change:class",
+                message = "未找到 OplusCommonInjector，主题/图标包切换后通知图标不会立即刷新",
+            )
+            return null
+        }
+        val method = Reflection.findMethodReturning(
+            injector,
+            "applyConfigurationToResourcesForResourcesManager",
+            Void.TYPE,
+            android.content.res.Configuration::class.java,
+            Int::class.javaPrimitiveType!!,
+        ) ?: run {
+            diagnostics.memberMissing(
+                scope = "systemui:theme_change:method",
+                message = "OplusCommonInjector 配置应用方法签名不匹配，主题/图标包切换后通知图标不会立即刷新",
+            )
+            return null
+        }
+        return ThemeChangeMembers(applyConfigurationToResources = method)
+    }
+
+    fun resolveUseAppIcon(classLoader: ClassLoader): Method? {        val clazz = loadOptional(OPLUS_SMALL_ICON_UTIL, classLoader) ?: return null
         return Reflection.findMethodReturning(
             clazz,
             "useAppIconForSmallIcon",
@@ -1354,6 +1395,8 @@ internal object SystemUiMembers {
         "com.android.systemui.statusbar.notification.collection.NotifPipeline"
     private const val OPLUS_SMALL_ICON_UTIL =
         "com.oplus.systemui.statusbar.notification.util.OplusNotificationSmallIconUtil"
+    /** ColorOS 进程应用新配置的通用注入类，主题/图标样式变化只能在这里看到标志位。 */
+    private const val OPLUS_COMMON_INJECTOR = "oplus.android.OplusCommonInjector"
     private const val AOD_NOTIFICATION_LAYOUT =
         "com.oplus.systemui.aod.aodclock.off.notification.NotificationLayout"
     private const val LOCK_SCREEN_NOTIFICATION_ICON_DATA =

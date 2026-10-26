@@ -21,6 +21,7 @@ internal enum class DiagnosticEvent(val id: String) {
     HookRuntimeFailed("hook.runtime_failed"),
     IconRenderClamped("icon.render_clamped"),
     ThemeIconBlank("theme.icon_blank"),
+    ThemeChanged("theme.changed"),
     IconReapplied("icon.reapplied"),
     HostAvatarYield("icon.host_avatar_yield"),
     HostAvatarReplace("icon.host_avatar_replace"),

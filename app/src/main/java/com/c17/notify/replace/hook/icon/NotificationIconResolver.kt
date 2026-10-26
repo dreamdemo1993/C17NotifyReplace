@@ -321,6 +321,10 @@ internal class NotificationIconResolver(
 
     private val Context.defaultPanelIconTint: Int
         get() {
+            // ColorOS 17 paints the shade as liquid glass: the dark neutral the panel used in light
+            // mode has no contrast against that backdrop, so the night colour is used in both
+            // modes from 17 on.
+            if (PlatformVersion.isColorOS17OrNewer) return DARK_PANEL_ICON_TINT
             val nightMode = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
             return if (nightMode == Configuration.UI_MODE_NIGHT_YES) {
                 DARK_PANEL_ICON_TINT

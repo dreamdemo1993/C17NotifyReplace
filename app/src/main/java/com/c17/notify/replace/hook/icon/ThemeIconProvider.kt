@@ -217,11 +217,17 @@ internal class ThemeIconProvider(
             ?: packageInfo.applicationInfo.takeUnless { it === packageInfo.itemInfo }?.let {
                 loadThemeDrawable(context, it, packageInfo.applicationInfo)
             }
+            // Second engine entry point: ColorOS patches `PackageItemInfo.loadIcon` for the system
+            // callers in its whitelist so that it returns the *current desktop* icon, which is the
+            // themed one whenever the app has a theme pack. `UxIconPackageManagerExt` sometimes
+            // answers nothing for an app the launcher itself renders fine (the pdd / 天气 rows that
+            // fell back to ColorOS' raw icon), so the launcher path is asked before giving up.
+            ?: loadLauncherDrawable(context, packageInfo.itemInfo)
         if (drawable == null) {
             diagnostics.report(
                 level = DiagnosticLevel.Debug,
                 event = DiagnosticEvent.PackageIconResolved,
-                message = "主题图标解析：$packageName 主题图标接口返回空，本次保留宿主图标",
+                message = "主题图标解析：$packageName 主题图标接口与桌面图标入口均返回空，本次保留宿主图标",
                 attributes = mapOf("package" to packageName, "stage" to "ux_icon"),
                 occurrence = OccurrencePolicy.RateLimited("theme_icon:no_drawable:$packageName", 600_000L),
             )
@@ -303,6 +309,26 @@ internal class ThemeIconProvider(
 
         return uxApi.loadItemIcon?.invokeDrawable(uxIconManager, itemInfo, applicationInfo)
             ?: uxApi.loadItemIconWithoutEdit?.invokeDrawable(uxIconManager, itemInfo, applicationInfo)
+    }
+
+    /**
+     * The launcher's own answer for the app icon.
+     *
+     * ColorOS only serves the themed artwork to callers on its whitelist, which is why this is
+     * asked from the SystemUI process and never from a notification's own context. Apps that ship
+     * no theme pack simply answer with their regular icon — the caller keeps the host artwork in
+     * that case, because the result goes through the same blank-sheet check as the engine.
+     */
+    @Suppress("DEPRECATION")
+    private fun loadLauncherDrawable(context: Context, itemInfo: PackageItemInfo): Drawable? = try {
+        itemInfo.loadIcon(context.packageManager)?.mutate()
+    } catch (exception: Exception) {
+        diagnostics.runtimeFailure(
+            scope = "theme_icon:launcher_fallback",
+            message = "读取桌面图标失败，本次保留宿主图标",
+            cause = exception,
+        )
+        null
     }
 
     private fun Method.invokeDrawable(
