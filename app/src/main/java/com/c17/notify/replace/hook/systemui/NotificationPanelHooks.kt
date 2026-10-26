@@ -824,7 +824,7 @@ internal class NotificationPanelHooks(
             ) ?: return
             if (!configuration.isCurrent(snapshot)) return
             writeGroupSummaryPlan(iconView, plan)
-            reportGroupSummaryAnchor(iconView, row, sbn)
+            reportGroupSummaryAnchor(iconView, row, sbn, "attachBadge")
             writeAlternateGroupBadge(iconView, row, sbn, snapshot, plan)
             if (verifyAfterWrite) {
                 // The guard re-writes the *resolved* plan, never a fresh lookup: the row's verdict
@@ -875,21 +875,25 @@ internal class NotificationPanelHooks(
         iconView: ImageView,
         row: Any?,
         sbn: StatusBarNotification,
+        source: String,
     ) {
-        val rowView = row as? View ?: return
+        val badge = (row as? View)?.findOplusGroupSummaryIcon()
         val idName = runCatching {
             if (iconView.id == View.NO_ID) "no_id" else iconView.resources.getResourceEntryName(iconView.id)
         }.getOrDefault("unknown")
-        val badge = rowView.findOplusGroupSummaryIcon()
+        // The entry-based paths never hand over the row, so the badge comparison is simply unknown
+        // there instead of "missing" — reporting false would read as a failure that never happened.
+        val badgeHit = if (row == null) "n/a" else (badge != null).toString()
+        val sameInstance = if (row == null) "n/a" else (badge === iconView).toString()
         diagnostics.report(
             level = DiagnosticLevel.Debug,
             event = DiagnosticEvent.PackageIconResolved,
-            message = "聚合徽标定位：${sbn.packageName} 写入 id=$idName " +
+            message = "聚合徽标定位[$source]：${sbn.packageName} 写入 id=$idName " +
                 "size=${iconView.width}x${iconView.height} attached=${iconView.isAttachedToWindow} " +
-                "visible=${iconView.visibility == View.VISIBLE} 徽标命中=${badge != null} " +
-                "同实例=${badge === iconView}",
-            attributes = mapOf("package" to sbn.packageName, "key" to sbn.key),
-            occurrence = OccurrencePolicy.Once("panel:group_anchor:${sbn.key}"),
+                "visible=${iconView.visibility == View.VISIBLE} 徽标命中=$badgeHit " +
+                "同实例=$sameInstance",
+            attributes = mapOf("package" to sbn.packageName, "key" to sbn.key, "source" to source),
+            occurrence = OccurrencePolicy.Once("panel:group_anchor:$source:${sbn.key}"),
         )
     }
 
@@ -989,6 +993,7 @@ internal class NotificationPanelHooks(
                     plan.tintColor?.let { tint ->
                         iconView.colorFilter = PorterDuffColorFilter(tint, PorterDuff.Mode.SRC_IN)
                     }
+                    reportGroupSummaryAnchor(iconView, null, sbn, "initIconViewColor")
                     null
                 } catch (exception: Exception) {
                     diagnostics.runtimeFailure(
@@ -1390,7 +1395,7 @@ internal class NotificationPanelHooks(
 
             icon.applyRenderPlan(plan, target)
             if (target == PanelIconTarget.OplusGroupSummary) {
-                reportGroupSummaryAnchor(icon, row, sbn)
+                reportGroupSummaryAnchor(icon, row, sbn, "panelIcon")
                 writeAlternateGroupBadge(icon, row, sbn, snapshot, plan)
             }
             if (target == PanelIconTarget.Header) {
@@ -1560,6 +1565,13 @@ internal class NotificationPanelHooks(
                 return true
             }
             val key = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }.getOrNull()
+            // A freshly inflated row answers null here for its first frames: the host binds the entry
+            // asynchronously, so [statusBarNotificationFromRow] finds nothing yet. Reading that as
+            // "the row now shows something else" stopped the guard before the row had ever drawn,
+            // and the host's raw app icon then stayed on screen until SystemUI restarted — the "two
+            // notifications from one app, one replaced and one original, both correct after a
+            // restart" report. Only a *different* key means the row was genuinely reused.
+            if (key == null) return true
             if (key != sbn.key) {
                 stop()
                 return true
@@ -1759,6 +1771,13 @@ internal class NotificationPanelHooks(
                 return true
             }
             val key = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }.getOrNull()
+            // A freshly inflated row answers null here for its first frames: the host binds the entry
+            // asynchronously, so [statusBarNotificationFromRow] finds nothing yet. Reading that as
+            // "the row now shows something else" stopped the guard before the row had ever drawn,
+            // and the host's raw app icon then stayed on screen until SystemUI restarted — the "two
+            // notifications from one app, one replaced and one original, both correct after a
+            // restart" report. Only a *different* key means the row was genuinely reused.
+            if (key == null) return true
             if (key != sbn.key) {
                 stop()
                 return true
@@ -1893,6 +1912,13 @@ internal class NotificationPanelHooks(
                 return true
             }
             val key = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }.getOrNull()
+            // A freshly inflated row answers null here for its first frames: the host binds the entry
+            // asynchronously, so [statusBarNotificationFromRow] finds nothing yet. Reading that as
+            // "the row now shows something else" stopped the guard before the row had ever drawn,
+            // and the host's raw app icon then stayed on screen until SystemUI restarted — the "two
+            // notifications from one app, one replaced and one original, both correct after a
+            // restart" report. Only a *different* key means the row was genuinely reused.
+            if (key == null) return true
             if (key != sbn.key) {
                 stop()
                 return true
@@ -1978,6 +2004,7 @@ internal class NotificationPanelHooks(
                 return
             }
             iconView.applyRenderPlan(plan, PanelIconTarget.OplusGroupSummary)
+            reportGroupSummaryAnchor(iconView, null, sbn, "entryIconDrawable")
         } catch (exception: Exception) {
             diagnostics.runtimeFailure(
                 scope = "panel:replace_icon:${PanelIconTarget.OplusGroupSummary.diagnosticName}",
