@@ -53,6 +53,9 @@ fun C17NotifyReplaceRoot(
         state = ruleState,
         onRuleIconSourceChange = onRuleIconSourceChange,
         onBindUnadaptedApp = onBindUnadaptedApp,
+        onRuleEnabledChange = onRuleEnabledChange,
+        onRuleEnabledAllChange = onRuleEnabledAllChange,
+        onRuleAvatarPriorityChange = onRuleAvatarPriorityChange,
         snackbarHostState = snackbarHostState,
         onRootNavigationChange = { rulesIsRootNavigation = it },
     ) { onChooseIcon, onAddUnadaptedApp, onOpenRule ->

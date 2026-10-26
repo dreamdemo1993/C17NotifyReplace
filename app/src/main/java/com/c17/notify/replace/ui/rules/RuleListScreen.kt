@@ -79,6 +79,9 @@ internal fun RuleNavigationHost(
     state: RuleListState,
     onRuleIconSourceChange: (IconRule, String?, (String) -> Unit) -> Unit,
     onBindUnadaptedApp: (InstalledAppChoice, String, (String) -> Unit) -> Unit,
+    onRuleEnabledChange: (IconRule, Boolean, (String) -> Unit) -> Unit,
+    onRuleEnabledAllChange: (IconRule, Boolean, (String) -> Unit) -> Unit,
+    onRuleAvatarPriorityChange: (IconRule, Boolean, (String) -> Unit) -> Unit,
     snackbarHostState: SnackbarHostState,
     onRootNavigationChange: (Boolean) -> Unit = {},
     content: @Composable (
@@ -520,6 +523,9 @@ internal fun StandaloneRuleListScreen(
         state = state,
         onRuleIconSourceChange = onRuleIconSourceChange,
         onBindUnadaptedApp = onBindUnadaptedApp,
+        onRuleEnabledChange = onRuleEnabledChange,
+        onRuleEnabledAllChange = onRuleEnabledAllChange,
+        onRuleAvatarPriorityChange = onRuleAvatarPriorityChange,
         snackbarHostState = snackbarHostState,
     ) { onChooseIcon, onAddUnadaptedApp, onOpenRule ->
         RuleListScreen(
