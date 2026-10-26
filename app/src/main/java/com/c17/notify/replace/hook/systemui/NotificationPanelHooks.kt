@@ -929,7 +929,10 @@ internal class NotificationPanelHooks(
         iconView.postDelayed({
             try {
                 if (!configuration.isCurrent(snapshot) || !iconView.isAttachedToWindow) return@postDelayed
-                if (statusBarNotificationFromRow(row)?.key != sbn.key) return@postDelayed
+                // Null means the entry is not bound yet, not that the row changed hands; dropping
+                // the verification chain there is what left the first painted row unchecked.
+                val currentKey = statusBarNotificationFromRow(row)?.key
+                if (currentKey != null && currentKey != sbn.key) return@postDelayed
                 if (iconView.drawable === written) {
                     verifyGroupSummaryIconAfterWrite(iconView, row, sbn, snapshot, pass + 1, plan)
                     return@postDelayed
@@ -1463,7 +1466,9 @@ internal class NotificationPanelHooks(
         rowView.postDelayed({
             try {
                 if (!configuration.isCurrent(snapshot) || !icon.isAttachedToWindow) return@postDelayed
-                if (statusBarNotificationFromRow(row)?.key != sbn.key) return@postDelayed
+                // See verifyGroupSummaryIconAfterWrite: an unbound entry must not end the chain.
+                val currentKey = statusBarNotificationFromRow(row)?.key
+                if (currentKey != null && currentKey != sbn.key) return@postDelayed
                 if (icon.drawable === written) {
                     verifyIconAfterWrite(icon, wrapper, row, sbn, snapshot, target, pass + 1, reapplyPlan)
                     return@postDelayed
