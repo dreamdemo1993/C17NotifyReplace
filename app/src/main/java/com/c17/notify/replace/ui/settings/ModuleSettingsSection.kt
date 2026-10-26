@@ -14,15 +14,8 @@ fun ModuleSettingsSection(
     onLockScreenCapsuleIconReplacementEnabledChange: (Boolean) -> Unit,
     onOplusPushSpecialHandlingEnabledChange: (Boolean) -> Unit,
     onPlaceholderIconEnabledChange: (Boolean) -> Unit,
-    onHostAvatarPriorityEnabledChange: (Boolean) -> Unit,
 ) {
     val canEditConfig = state.canEditConfig
-    ToggleComponent(
-        title = stringResource(R.string.label_host_avatar_priority),
-        checked = state.config.hostAvatarPriorityEnabled,
-        enabled = canEditConfig,
-        onCheckedChange = onHostAvatarPriorityEnabledChange,
-    )
     ToggleComponent(
         title = stringResource(R.string.label_icon_enhancement_enabled),
         checked = state.config.rulesEnabled,
@@ -54,6 +47,26 @@ fun ModuleSettingsSection(
         checked = state.config.placeholderIconEnabled,
         enabled = canEditConfig && state.config.rulesEnabled,
         onCheckedChange = onPlaceholderIconEnabledChange,
+    )
+}
+
+/**
+ * The personal-avatar switch lives in a card of its own.
+ *
+ * It is the one option that *turns the module off* for a package — the host draws the contact photo
+ * and the module stays out of the way — so it reads as a separate decision rather than one more
+ * toggle in the icon list.
+ */
+@Composable
+fun HostAvatarSection(
+    state: HomeScreenState,
+    onHostAvatarPriorityEnabledChange: (Boolean) -> Unit,
+) {
+    ToggleComponent(
+        title = stringResource(R.string.label_host_avatar_priority),
+        checked = state.config.hostAvatarPriorityEnabled,
+        enabled = state.canEditConfig,
+        onCheckedChange = onHostAvatarPriorityEnabledChange,
     )
 }
 

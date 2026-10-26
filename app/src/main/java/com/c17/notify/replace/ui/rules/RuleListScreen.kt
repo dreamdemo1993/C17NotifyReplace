@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -24,18 +24,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.c17.notify.replace.R
 import com.c17.notify.replace.rules.IconRule
+import com.c17.notify.replace.ui.component.CardSegment
 import com.c17.notify.replace.ui.component.MiuixBlurredTopBar
 import com.c17.notify.replace.ui.component.rememberMiuixPageBackdrop
 import com.c17.notify.replace.ui.theme.C17NotifyReplaceTheme
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.BasicComponent
-import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InputField
@@ -64,8 +63,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.utils.scrollEndHaptic
 
+/** Vertical gap between two grouped cards; rows inside one card have none. */
+private val SECTION_SPACING = 12.dp
+
 private sealed interface RuleListRoute : NavKey {
     data object List : RuleListRoute
+    data class Detail(val packageName: String) : RuleListRoute
     data class IconPicker(val rule: IconRule) : RuleListRoute
     data object UnadaptedAppPicker : RuleListRoute
     data class UnadaptedIconPicker(val app: InstalledAppChoice) : RuleListRoute
@@ -81,6 +84,7 @@ internal fun RuleNavigationHost(
     content: @Composable (
         onChooseIcon: (IconRule) -> Unit,
         onAddUnadaptedApp: () -> Unit,
+        onOpenRule: (IconRule) -> Unit,
     ) -> Unit,
 ) {
     val backStack = remember { navBackStackOf(RuleListRoute.List) }
@@ -116,7 +120,30 @@ internal fun RuleNavigationHost(
             content(
                 { navigate(RuleListRoute.IconPicker(it)) },
                 { navigate(RuleListRoute.UnadaptedAppPicker) },
+                { navigate(RuleListRoute.Detail(it.packageName)) },
             )
+        }
+        entry<RuleListRoute.Detail> { route ->
+            // Read the rule back out of the live state instead of the one captured at navigation
+            // time: flipping a switch here republishes the state, and the screen must show the
+            // value the store now holds.
+            val rule = state.rules.firstOrNull { it.packageName == route.packageName }
+            if (rule == null) {
+                LaunchedEffect(route) { backStack.removeLastOrNull() }
+            } else {
+                RuleDetailScreen(
+                    rule = rule,
+                    rulesEnabled = state.config.rulesEnabled,
+                    canEditConfig = state.canEditConfig,
+                    avatarPriorityEnabled = state.config.hostAvatarPriorityEnabled,
+                    avatarPriority = state.config.avatarPriorityPackages.contains(rule.packageName),
+                    onEnabledChange = { onRuleEnabledChange(rule, it, ::showSnackbar) },
+                    onEnabledAllChange = { onRuleEnabledAllChange(rule, it, ::showSnackbar) },
+                    onAvatarPriorityChange = { onRuleAvatarPriorityChange(rule, it, ::showSnackbar) },
+                    onChooseIcon = { navigate(RuleListRoute.IconPicker(rule)) },
+                    onBack = { backStack.removeLastOrNull() },
+                )
+            }
         }
         entry<RuleListRoute.IconPicker> { route ->
             IconPickerScreen(
@@ -173,6 +200,7 @@ fun RuleListScreen(
     snackbarHostState: SnackbarHostState,
     onChooseIcon: (IconRule) -> Unit,
     onAddUnadaptedApp: () -> Unit,
+    onOpenRule: (IconRule) -> Unit = {},
     navigationIcon: @Composable () -> Unit = {},
     showSnackbarHost: Boolean = false,
 ) {
@@ -216,6 +244,7 @@ fun RuleListScreen(
             onShowMessage = ::showSnackbar,
             onChooseIcon = onChooseIcon,
             onAddUnadaptedApp = onAddUnadaptedApp,
+            onOpenRule = onOpenRule,
         )
     }
 }
@@ -234,6 +263,7 @@ private fun RuleListContent(
     onShowMessage: (String) -> Unit,
     onChooseIcon: (IconRule) -> Unit,
     onAddUnadaptedApp: () -> Unit,
+    onOpenRule: (IconRule) -> Unit,
 ) {
     var searchExpanded by remember { mutableStateOf(false) }
     // The status bar always uses the rule library, so manual icon binding stays available.
@@ -293,6 +323,9 @@ private fun RuleListContent(
                 }
             } else {
                 if (state.libraryRules.isNotEmpty() && state.query.isBlank()) {
+                    item(key = "add:unadapted:title") {
+                        SmallTitle(text = stringResource(R.string.section_unadapted))
+                    }
                     item(key = "add:unadapted") {
                         AddUnadaptedAppCard(
                             enabled = canChooseIcon,
@@ -301,40 +334,46 @@ private fun RuleListContent(
                     }
                 }
                 sections.forEach { section ->
+                    val leadingRow = section.type == RuleSectionType.Installed && state.query.isBlank()
                     item(key = "section:${section.type}") {
                         RuleSectionTitle(section)
                     }
-                    if (section.type == RuleSectionType.Installed && state.query.isBlank()) {
+                    if (leadingRow) {
                         item(key = "installed:enabled_all") {
-                            InstalledRulesEnabledAllCard(
-                                checked = state.installedRulesEnabledAll,
-                                enabled = state.canEditConfig &&
-                                    state.config.rulesEnabled &&
-                                    state.installedEnabledRulePackageNames.isNotEmpty(),
-                                onCheckedChange = {
-                                    onInstalledRulesEnabledAllChange(it, onShowMessage)
-                                },
-                            )
+                            CardSegment(isFirst = true, isLast = section.rules.isEmpty()) {
+                                SwitchPreference(
+                                    title = stringResource(R.string.label_installed_rules_enabled_all),
+                                    checked = state.installedRulesEnabledAll,
+                                    onCheckedChange = {
+                                        onInstalledRulesEnabledAllChange(it, onShowMessage)
+                                    },
+                                    enabled = state.canEditConfig &&
+                                        state.config.rulesEnabled &&
+                                        state.installedEnabledRulePackageNames.isNotEmpty(),
+                                )
+                            }
                         }
                     }
-                    items(
+                    // One row per app, one card per section: the corner radius is what glues the
+                    // rows into a single surface, so only the section's first and last row carry it.
+                    itemsIndexed(
                         items = section.rules,
-                        key = { it.packageName },
-                    ) { rule ->
-                        RuleCard(
-                            rule = rule,
-                            rulesEnabled = state.config.rulesEnabled,
-                            canEditConfig = state.canEditConfig,
-                            onEnabledChange = { onRuleEnabledChange(rule, it, onShowMessage) },
-                            onEnabledAllChange = { onRuleEnabledAllChange(rule, it, onShowMessage) },
-                            avatarPriorityEnabled = state.config.hostAvatarPriorityEnabled,
-                            avatarPriority = state.config.avatarPriorityPackages
-                                .contains(rule.packageName),
-                            onAvatarPriorityChange = {
-                                onRuleAvatarPriorityChange(rule, it, onShowMessage)
+                        key = { _, rule -> rule.packageName },
+                    ) { index, rule ->
+                        CardSegment(
+                            isFirst = index == 0 && !leadingRow,
+                            isLast = index == section.rules.lastIndex,
+                            outerBottomPadding = if (index == section.rules.lastIndex) {
+                                SECTION_SPACING
+                            } else {
+                                0.dp
                             },
-                            onChooseIcon = { onChooseIcon(rule) },
-                        )
+                        ) {
+                            RuleRow(
+                                rule = rule,
+                                onClick = { onOpenRule(rule) },
+                            )
+                        }
                     }
                 }
             }
@@ -347,37 +386,15 @@ private fun AddUnadaptedAppCard(
     enabled: Boolean,
     onClick: () -> Unit,
 ) {
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 10.dp),
-        insideMargin = PaddingValues(0.dp),
+    CardSegment(
+        isFirst = true,
+        isLast = true,
+        outerBottomPadding = SECTION_SPACING,
     ) {
         ArrowPreference(
             title = stringResource(R.string.label_add_unadapted_app),
             summary = stringResource(R.string.label_add_unadapted_app_summary),
             onClick = onClick,
-            enabled = enabled,
-        )
-    }
-}
-
-@Composable
-private fun InstalledRulesEnabledAllCard(
-    checked: Boolean,
-    enabled: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-) {
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 10.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
-        SwitchPreference(
-            title = stringResource(R.string.label_installed_rules_enabled_all),
-            checked = checked,
-            onCheckedChange = onCheckedChange,
             enabled = enabled,
         )
     }
@@ -393,80 +410,50 @@ private fun RuleSectionTitle(section: RuleSection) {
     SmallTitle(text = text)
 }
 
+/**
+ * A single app in the list.
+ *
+ * Deliberately one line of information plus one state label: the switches moved to
+ * [RuleDetailScreen], because five rows per app had the list showing two apps per screen and none
+ * of the controls were what a scan looks for. The status label is the only thing that has to be
+ * visible from here — "is this app covered".
+ */
 @Composable
-private fun RuleCard(
+private fun RuleRow(
     rule: IconRule,
-    rulesEnabled: Boolean,
-    canEditConfig: Boolean,
-    avatarPriorityEnabled: Boolean,
-    avatarPriority: Boolean,
-    onEnabledChange: (Boolean) -> Unit,
-    onEnabledAllChange: (Boolean) -> Unit,
-    onAvatarPriorityChange: (Boolean) -> Unit,
-    onChooseIcon: () -> Unit,
+    onClick: () -> Unit,
 ) {
-    val canChooseIcon = canEditConfig && rulesEnabled
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 10.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
-        BasicComponent(
-            startAction = { RuleIcon(rule) },
-            insideMargin = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-            onClick = if (canChooseIcon) onChooseIcon else null,
-        ) {
+    BasicComponent(
+        startAction = { RuleIcon(rule) },
+        title = rule.appName.ifBlank { rule.packageName },
+        summary = buildString {
+            append(rule.packageName)
+            if (rule.contributorName.isNotBlank()) {
+                append(" · ")
+                append(rule.contributorName)
+            }
+        },
+        endActions = {
             Text(
-                text = rule.appName.ifBlank { rule.packageName },
-                style = MiuixTheme.textStyles.headline1,
-                color = MiuixTheme.colorScheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = buildString {
-                    append(rule.packageName)
-                    if (rule.contributorName.isNotBlank()) {
-                        append(" · ")
-                        append(rule.contributorName)
-                    }
-                },
+                text = stringResource(
+                    if (rule.isEnabled) R.string.rules_status_enabled else R.string.rules_status_disabled,
+                ),
                 style = MiuixTheme.textStyles.body2,
-                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                color = if (rule.isEnabled) {
+                    MiuixTheme.colorScheme.primary
+                } else {
+                    MiuixTheme.colorScheme.onSurfaceVariantSummary
+                },
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
-        }
-        ArrowPreference(
-            title = stringResource(R.string.label_rule_choose_icon),
-            summary = iconSourceSummary(rule),
-            onClick = onChooseIcon,
-            enabled = canChooseIcon,
-        )
-        ToggleComponent(
-            title = stringResource(R.string.label_rule_enable),
-            checked = rule.isEnabled,
-            enabled = canChooseIcon,
-            onCheckedChange = onEnabledChange,
-        )
-        ToggleComponent(
-            title = stringResource(R.string.label_rule_force_all),
-            checked = rule.isEnabledAll,
-            enabled = canChooseIcon && rule.isEnabled,
-            onCheckedChange = onEnabledAllChange,
-        )
-        ToggleComponent(
-            title = stringResource(R.string.label_host_avatar_priority),
-            checked = avatarPriority,
-            enabled = canEditConfig && avatarPriorityEnabled,
-            onCheckedChange = onAvatarPriorityChange,
-        )
-    }
+        },
+        insideMargin = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+        onClick = onClick,
+    )
 }
 
 @Composable
-private fun iconSourceSummary(rule: IconRule): String = when {
+internal fun iconSourceSummary(rule: IconRule): String = when {
     rule.iconSourcePackage == null -> stringResource(R.string.label_rule_choose_icon_default)
     rule.sourcedFrom != null -> stringResource(
         R.string.label_rule_choose_icon_using,
@@ -485,30 +472,15 @@ private fun RuleIcon(rule: IconRule) {
 }
 
 @Composable
-private fun ToggleComponent(
-    title: String,
-    checked: Boolean,
-    enabled: Boolean = true,
-    onCheckedChange: (Boolean) -> Unit,
-) {
-    SwitchPreference(
-        title = title,
-        checked = checked,
-        onCheckedChange = onCheckedChange,
-        enabled = enabled,
-    )
-}
-
-@Composable
 private fun EmptyRulesCard(
     query: String,
     isLoading: Boolean,
     loadFailed: Boolean,
 ) {
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
+    CardSegment(
+        isFirst = true,
+        isLast = true,
+        outerBottomPadding = SECTION_SPACING,
     ) {
         Row(
             modifier = Modifier
@@ -549,7 +521,7 @@ internal fun StandaloneRuleListScreen(
         onRuleIconSourceChange = onRuleIconSourceChange,
         onBindUnadaptedApp = onBindUnadaptedApp,
         snackbarHostState = snackbarHostState,
-    ) { onChooseIcon, onAddUnadaptedApp ->
+    ) { onChooseIcon, onAddUnadaptedApp, onOpenRule ->
         RuleListScreen(
             state = state,
             onQueryChange = onQueryChange,
@@ -561,6 +533,7 @@ internal fun StandaloneRuleListScreen(
             snackbarHostState = snackbarHostState,
             onChooseIcon = onChooseIcon,
             onAddUnadaptedApp = onAddUnadaptedApp,
+            onOpenRule = onOpenRule,
             navigationIcon = {
                 IconButton(onClick = onBack) {
                     Icon(

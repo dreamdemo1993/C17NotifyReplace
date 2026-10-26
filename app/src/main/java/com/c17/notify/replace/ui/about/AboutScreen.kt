@@ -28,10 +28,12 @@ import com.c17.notify.replace.ui.component.blur.BlurredBar
 import com.c17.notify.replace.ui.component.blur.rememberBlurBackdrop
 import com.c17.notify.replace.ui.component.groupedCardItems
 import com.c17.notify.replace.ui.home.HomeScreenState
+import com.c17.notify.replace.ui.settings.HostAvatarSection
 import com.c17.notify.replace.ui.settings.ModuleSettingsSection
 import com.c17.notify.replace.ui.theme.ThemeConfig
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
+import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.nav.core.NavDisplay
 import top.yukonga.miuix.kmp.nav.core.NavDisplayEffects
@@ -156,9 +158,10 @@ private fun SettingsMainScreen(
                 bottom = maxOf(bottomPadding, innerPadding.calculateBottomPadding()),
             ),
         ) {
+            item { SmallTitle(text = stringResource(R.string.section_feature_settings)) }
             groupedCardItems(
                 keyPrefix = "settings_module",
-                outerTopPadding = 12.dp,
+                outerTopPadding = 0.dp,
                 outerBottomPadding = 12.dp,
                 items = listOf(
                     CardItem("moduleSettings") {
@@ -170,13 +173,28 @@ private fun SettingsMainScreen(
                                 onLockScreenCapsuleIconReplacementEnabledChange,
                             onOplusPushSpecialHandlingEnabledChange = onOplusPushSpecialHandlingEnabledChange,
                             onPlaceholderIconEnabledChange = onPlaceholderIconEnabledChange,
+                        )
+                    },
+                ),
+            )
+            item { SmallTitle(text = stringResource(R.string.settings_section_avatar)) }
+            groupedCardItems(
+                keyPrefix = "settings_avatar",
+                outerTopPadding = 0.dp,
+                outerBottomPadding = 12.dp,
+                items = listOf(
+                    CardItem("hostAvatar") {
+                        HostAvatarSection(
+                            state = homeState,
                             onHostAvatarPriorityEnabledChange = onHostAvatarPriorityEnabledChange,
                         )
                     },
                 ),
             )
+            item { SmallTitle(text = stringResource(R.string.section_app_settings)) }
             groupedCardItems(
                 keyPrefix = "settings_app",
+                outerTopPadding = 0.dp,
                 outerBottomPadding = 12.dp,
                 items = listOf(
                     CardItem("hideLauncherIcon") {
@@ -188,8 +206,10 @@ private fun SettingsMainScreen(
                     },
                 ),
             )
+            item { SmallTitle(text = stringResource(R.string.settings_section_appearance)) }
             groupedCardItems(
                 keyPrefix = "settings_appearance",
+                outerTopPadding = 0.dp,
                 outerBottomPadding = 12.dp,
                 items = listOf(
                     CardItem("theme") {
@@ -201,8 +221,10 @@ private fun SettingsMainScreen(
                     },
                 ),
             )
+            item { SmallTitle(text = stringResource(R.string.settings_section_about)) }
             groupedCardItems(
                 keyPrefix = "settings_about",
+                outerTopPadding = 0.dp,
                 outerBottomPadding = 24.dp,
                 items = listOf(
                     CardItem("about") {

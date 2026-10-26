@@ -55,7 +55,7 @@ fun C17NotifyReplaceRoot(
         onBindUnadaptedApp = onBindUnadaptedApp,
         snackbarHostState = snackbarHostState,
         onRootNavigationChange = { rulesIsRootNavigation = it },
-    ) { onChooseIcon, onAddUnadaptedApp ->
+    ) { onChooseIcon, onAddUnadaptedApp, onOpenRule ->
         MainShell(
             home = MainTabSlot { bottomPadding ->
                 HomeScreen(
@@ -78,6 +78,7 @@ fun C17NotifyReplaceRoot(
                     snackbarHostState = snackbarHostState,
                     onChooseIcon = onChooseIcon,
                     onAddUnadaptedApp = onAddUnadaptedApp,
+                    onOpenRule = onOpenRule,
                 )
             },
             about = MainTabSlot { bottomPadding ->

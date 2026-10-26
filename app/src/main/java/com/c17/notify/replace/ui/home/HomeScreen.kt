@@ -12,15 +12,12 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -65,28 +62,26 @@ import com.c17.notify.replace.rules.RuleSourceConfig
 import com.c17.notify.replace.rules.RuleSourceType
 import com.c17.notify.replace.rules.readRuleSourceConfig
 import com.c17.notify.replace.rules.writeRuleSourceConfig
+import com.c17.notify.replace.ui.component.CardSegment
 import com.c17.notify.replace.ui.component.MiuixBlurredTopBar
-import com.c17.notify.replace.ui.component.PreferenceGroup
 import com.c17.notify.replace.ui.component.rememberMiuixPageBackdrop
 import com.c17.notify.replace.ui.theme.C17NotifyReplaceTheme
 import kotlinx.coroutines.launch
-import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
+import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.SnackbarHostState
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.blur.layerBackdrop
-import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.Download
-import top.yukonga.miuix.kmp.icon.extended.Refresh
 import top.yukonga.miuix.kmp.overlay.OverlayDialog
+import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.utils.scrollEndHaptic
@@ -166,14 +161,12 @@ fun HomeScreen(
         ) {
             item { StatusOverview(state = state) }
             item {
-                PreferenceGroup {
-                    RulesCard(
-                        state = state,
-                        sourceType = ruleSource.type,
-                        onSyncRules = ::openSourceDialog,
-                        onRestartClick = { showRestartDialog = true },
-                    )
-                }
+                RulesCard(
+                    state = state,
+                    sourceType = ruleSource.type,
+                    onSyncRules = ::openSourceDialog,
+                    onRestartClick = { showRestartDialog = true },
+                )
             }
             item { Spacer(modifier = Modifier.height(24.dp)) }
         }
@@ -382,44 +375,14 @@ private fun StatusOverview(state: HomeScreenState) {
     val heroSpec = statusHeroSpec(context, state, moduleVersionText)
 
     Column(
-        modifier = Modifier.padding(12.dp),
+        modifier = Modifier.padding(vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(IntrinsicSize.Min),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            StatusHeroCard(
-                spec = heroSpec,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight(),
-            )
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight(),
-            ) {
-                MetricCard(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    title = stringResource(R.string.home_card_rules),
-                    value = state.rulesCount.toString(),
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                MetricCard(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    title = stringResource(R.string.home_card_enabled),
-                    value = state.enabledRulesCount.toString(),
-                )
-            }
-        }
+        StatusHeroCard(
+            spec = heroSpec,
+            rulesCount = state.rulesCount,
+            enabledRulesCount = state.enabledRulesCount,
+        )
         SystemInfoCard(
             state = state,
             moduleVersionText = moduleVersionText,
@@ -429,73 +392,38 @@ private fun StatusOverview(state: HomeScreenState) {
 }
 
 @Composable
-private fun MetricCard(
-    modifier: Modifier,
-    title: String,
-    value: String,
-) {
-    Card(
-        modifier = modifier,
-        insideMargin = PaddingValues(16.dp),
-    ) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.Start,
-        ) {
-            Text(
-                modifier = Modifier.fillMaxWidth(),
-                text = title,
-                fontWeight = FontWeight.Medium,
-                fontSize = 15.sp,
-                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-            )
-            Text(
-                modifier = Modifier.fillMaxWidth(),
-                text = value,
-                fontSize = 26.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = MiuixTheme.colorScheme.onSurface,
-            )
-        }
-    }
-}
-
-@Composable
 private fun StatusHeroCard(
     spec: StatusHeroSpec,
-    modifier: Modifier = Modifier,
+    rulesCount: Int,
+    enabledRulesCount: Int,
 ) {
     Card(
-        modifier = modifier,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp),
         insideMargin = PaddingValues(),
         colors = CardDefaults.defaultColors(
             color = spec.containerColor,
             contentColor = spec.accentColor,
         ),
     ) {
-        Box(modifier = Modifier.fillMaxSize()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .offset(38.dp, 45.dp),
-                contentAlignment = Alignment.BottomEnd,
-            ) {
-                Icon(
-                    imageVector = spec.icon,
-                    contentDescription = null,
-                    modifier = Modifier.size(170.dp),
-                    tint = spec.accentColor,
-                )
-            }
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(16.dp),
-            ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = spec.icon,
+                contentDescription = null,
+                modifier = Modifier.size(34.dp),
+                tint = spec.accentColor,
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    modifier = Modifier.fillMaxWidth(),
                     text = spec.status,
-                    fontSize = 20.sp,
+                    fontSize = 18.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MiuixTheme.colorScheme.onSurface,
                     maxLines = 1,
@@ -503,16 +431,40 @@ private fun StatusHeroCard(
                 )
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
-                    modifier = Modifier.fillMaxWidth(),
                     text = spec.versionLine,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = MiuixTheme.colorScheme.onSurface,
-                    maxLines = 2,
+                    fontSize = 13.sp,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+            StatBlock(value = rulesCount.toString(), label = stringResource(R.string.home_card_rules))
+            Spacer(Modifier.width(18.dp))
+            StatBlock(value = enabledRulesCount.toString(), label = stringResource(R.string.home_card_enabled))
         }
+    }
+}
+
+/** A number and its label: the two figures that used to occupy half the screen as cards. */
+@Composable
+private fun StatBlock(
+    value: String,
+    label: String,
+) {
+    Column(horizontalAlignment = Alignment.End) {
+        Text(
+            text = value,
+            fontSize = 20.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MiuixTheme.colorScheme.onSurface,
+            maxLines = 1,
+        )
+        Text(
+            text = label,
+            fontSize = 11.sp,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            maxLines = 1,
+        )
     }
 }
 
@@ -543,55 +495,60 @@ private fun SystemInfoCard(
         )
         else -> stringResource(R.string.home_info_scopes_ready)
     }
-    Card {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-        ) {
-            InfoText(
-                title = stringResource(R.string.home_info_system_version),
-                content = softwareVersionText.ifBlank { deviceText },
-            )
-            InfoText(
-                title = stringResource(R.string.home_info_device),
-                content = deviceText,
-            )
-            InfoText(
-                title = stringResource(R.string.home_info_module_version),
-                content = moduleVersionText,
-            )
-            InfoText(
-                title = stringResource(R.string.home_info_framework),
-                content = frameworkText,
-            )
-            InfoText(
-                title = stringResource(R.string.home_info_scopes),
-                content = scopesText,
-                bottomPadding = 0.dp,
-            )
-        }
+    SmallTitle(text = stringResource(R.string.home_info_title))
+    CardSegment(isFirst = true, isLast = true) {
+        InfoRow(
+            title = stringResource(R.string.home_info_system_version),
+            content = softwareVersionText.ifBlank { deviceText },
+        )
+        InfoRow(
+            title = stringResource(R.string.home_info_device),
+            content = deviceText,
+        )
+        InfoRow(
+            title = stringResource(R.string.home_info_module_version),
+            content = moduleVersionText,
+        )
+        InfoRow(
+            title = stringResource(R.string.home_info_framework),
+            content = frameworkText,
+        )
+        InfoRow(
+            title = stringResource(R.string.home_info_scopes),
+            content = scopesText,
+        )
     }
 }
 
+/** Label on the leading edge, value right-aligned on one line: the density a settings page has. */
 @Composable
-private fun InfoText(
+private fun InfoRow(
     title: String,
     content: String,
-    bottomPadding: Dp = 24.dp,
 ) {
-    Text(
-        text = title,
-        fontSize = MiuixTheme.textStyles.headline1.fontSize,
-        fontWeight = FontWeight.Medium,
-        color = MiuixTheme.colorScheme.onSurface,
-    )
-    Text(
-        text = content,
-        fontSize = MiuixTheme.textStyles.body2.fontSize,
-        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-        modifier = Modifier.padding(top = 2.dp, bottom = bottomPadding),
-    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            modifier = Modifier.weight(1f),
+            text = title,
+            fontSize = MiuixTheme.textStyles.body1.fontSize,
+            color = MiuixTheme.colorScheme.onSurface,
+            maxLines = 1,
+        )
+        Text(
+            modifier = Modifier.weight(2f),
+            text = content,
+            fontSize = MiuixTheme.textStyles.body2.fontSize,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.End,
+        )
+    }
 }
 
 @Composable
@@ -619,39 +576,24 @@ private fun RulesCard(
         stringResource(ruleSourceLabelRes(sourceType)),
     )
 
-    BasicComponent(
-        title = when (state.syncStage) {
-            RuleSyncStage.Idle -> stringResource(R.string.button_sync_rules)
-            RuleSyncStage.SyncingRules -> stringResource(R.string.button_syncing_rules)
-            RuleSyncStage.MirroringRemote -> stringResource(R.string.button_mirroring_rules)
-        },
-        summary = "$syncSummary · $sourceSummary",
-        endActions = if (!state.isSyncing) {
-            {
-                Icon(
-                    imageVector = MiuixIcons.Download,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp),
-                    tint = MiuixTheme.colorScheme.onSurfaceVariantActions,
-                )
-            }
-        } else null,
-        onClick = onSyncRules,
-        enabled = !state.isSyncing && state.canEditConfig,
-    )
-    BasicComponent(
-        title = stringResource(R.string.label_restart_systemui),
-        endActions = {
-            Icon(
-                imageVector = MiuixIcons.Refresh,
-                contentDescription = null,
-                modifier = Modifier.size(20.dp),
-                tint = MiuixTheme.colorScheme.onSurfaceVariantActions,
-            )
-        },
-        onClick = onRestartClick,
-        enabled = state.canEditConfig,
-    )
+    SmallTitle(text = stringResource(R.string.home_quick_actions))
+    CardSegment(isFirst = true, isLast = true) {
+        ArrowPreference(
+            title = when (state.syncStage) {
+                RuleSyncStage.Idle -> stringResource(R.string.button_sync_rules)
+                RuleSyncStage.SyncingRules -> stringResource(R.string.button_syncing_rules)
+                RuleSyncStage.MirroringRemote -> stringResource(R.string.button_mirroring_rules)
+            },
+            summary = "$syncSummary · $sourceSummary",
+            onClick = onSyncRules,
+            enabled = !state.isSyncing && state.canEditConfig,
+        )
+        ArrowPreference(
+            title = stringResource(R.string.label_restart_systemui),
+            onClick = onRestartClick,
+            enabled = state.canEditConfig,
+        )
+    }
 }
 
 @Composable

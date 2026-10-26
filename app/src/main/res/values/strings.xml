@@ -7,6 +7,7 @@
     <string name="tab_about">关于</string>
     <string name="tab_settings">设置</string>
     <string name="settings_section_appearance">界面</string>
+    <string name="settings_section_avatar">个人头像</string>
     <string name="settings_section_about">关于</string>
     <string name="about_open_source">开放源代码许可</string>
     <string name="common_back">返回</string>
@@ -86,11 +87,16 @@
     <string name="home_info_framework_disconnected">未连接</string>
     <string name="home_info_scopes">作用域</string>
     <string name="home_info_scopes_ready">system · SystemUI</string>
+    <string name="home_info_title">设备信息</string>
+    <string name="home_quick_actions">快捷操作</string>
     <string name="section_module_status">状态</string>
     <string name="section_feature_settings">图标设置</string>
     <string name="section_app_settings">桌面图标</string>
     <string name="section_rules_data">规则</string>
     <string name="section_rule_management">规则列表</string>
+    <string name="section_unadapted">未适配应用</string>
+    <string name="rules_status_enabled">已启用</string>
+    <string name="rules_status_disabled">未启用</string>
     <string name="rules_group_installed">已安装 · %1$d</string>
     <string name="rules_group_not_installed">未安装 · %1$d</string>
     <string name="label_installed_rules_enabled_all">已安装应用全部替换</string>
@@ -130,6 +136,12 @@
     <string name="label_rule_choose_icon_using">使用「%1$s」的图标</string>
     <string name="label_rule_choose_icon_missing">指定来源已失效，将回退包名匹配</string>
     <string name="label_rule_clear_icon">清除手动指定</string>
+    <string name="rule_detail_title">规则详情</string>
+    <string name="rule_detail_section_behavior">替换行为</string>
+    <string name="rule_detail_section_icon">图标</string>
+    <string name="rule_detail_section_identity">应用信息</string>
+    <string name="rule_detail_package">包名</string>
+    <string name="rule_detail_contributor">贡献者</string>
     <string name="label_add_unadapted_app">为未适配应用指定图标</string>
     <string name="label_add_unadapted_app_summary">从已安装应用中选择，再借用规则库图标</string>
     <string name="icon_picker_title">选择图标</string>
