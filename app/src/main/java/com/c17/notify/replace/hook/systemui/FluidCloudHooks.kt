@@ -59,12 +59,10 @@ internal class FluidCloudHooks(
     private val loggedViews = Collections.synchronizedSet(HashSet<Int>())
     private val scheduledRoots = Collections.synchronizedSet(HashSet<Int>())
     private val modelDumped = Collections.synchronizedSet(HashSet<Int>())
+    private val fieldDumped = Collections.synchronizedSet(HashSet<Int>())
 
     /** 图标 View → 它所属应用。插件重新绑定图标时靠这张表把主题图标再贴回去。 */
     private val iconPackages = Collections.synchronizedMap(WeakHashMap<View, String>())
-
-    /** View → 从它身上挂的模型里解析出来的包名（可能多个，双卡胶囊就是两个）。 */
-    private val viewPackages = Collections.synchronizedMap(WeakHashMap<View, List<String>>())
 
     /** 图标控件类的 `setImageDrawable` 只挂一次。 */
     private val hookedClasses = Collections.synchronizedSet(HashSet<String>())
@@ -74,6 +72,10 @@ internal class FluidCloudHooks(
 
     /** 自己调用 `setImageDrawable` 时不要被自己的 hook 再拦一次。 */
     private val applying = ThreadLocal.withInitial { false }
+
+    /** SystemUI 的 Application，用来解析主题图标（插件上下文里取不到）。 */
+    @Volatile
+    private var hostApplication: Context? = null
 
     fun install() {
         hooks.install(members.containerAttached, "systemui.fluid_cloud.container") { chain ->
@@ -144,27 +146,61 @@ internal class FluidCloudHooks(
     private fun applyIcons(root: View) {
         try {
             val snapshot = configuration.snapshot
-            if (!snapshot.resolver.panelThemeIconsEnabled()) return
+            if (!snapshot.resolver.panelThemeIconsEnabled()) {
+                reportSkip(root, "主题图标开关未开启，跳过替换")
+                return
+            }
             val icons = collectIconViews(root)
-            if (icons.isEmpty()) return
-            val context = root.context?.applicationContext ?: return
+            if (icons.isEmpty()) {
+                reportSkip(root, "没有可见的应用图标控件", mapOf("tree" to briefTree(root)))
+                return
+            }
+            // 插件里的 View.context 是插件自己的包装上下文，主题引擎在里面取不到桌面图标，
+            // 所以优先用 SystemUI 的 Application，拿不到才退回 View 自带的上下文。
+            val context = hostContext() ?: root.context?.applicationContext ?: return
+            val skipped = ArrayList<String>(icons.size)
+            var replaced = 0
             for (icon in icons) {
-                val packageName = packageFor(icon) ?: continue
-                val drawable = replacementFor(context, packageName, snapshot) ?: continue
+                val idName = resourceName(icon, icon.id)
+                val packageName = packageFor(icon)
+                if (packageName == null) {
+                    skipped += "$idName=无包名"
+                    dumpAncestorsOnce(icon, root)
+                    continue
+                }
+                val drawable = replacementFor(context, packageName, snapshot)
+                if (drawable == null) {
+                    skipped += "$packageName=无主题图标"
+                    continue
+                }
                 iconPackages[icon] = packageName
                 hookIconClass(icon)
-                if (icon.drawable === drawable) continue
+                if (icon.drawable === drawable) {
+                    skipped += "$packageName=已是主题图标"
+                    continue
+                }
                 setIconDrawable(icon, drawable)
+                replaced++
                 diagnostics.report(
                     level = DiagnosticLevel.Info,
                     event = DiagnosticEvent.PackageIconResolved,
                     message = "流体云图标已替换：$packageName",
                     attributes = mapOf(
                         "package" to packageName,
-                        "id" to resourceName(icon, icon.id),
+                        "id" to idName,
                         "root" to root.javaClass.simpleName,
                     ),
                     occurrence = OccurrencePolicy.Once("fluid_cloud:icon:$packageName"),
+                )
+            }
+            if (skipped.isNotEmpty()) {
+                report(
+                    "流体云图标跳过：${skipped.joinToString("，")}",
+                    mapOf(
+                        "root" to root.javaClass.simpleName,
+                        "replaced" to replaced,
+                        "icons" to icons.size,
+                    ),
                 )
             }
         } catch (exception: Exception) {
@@ -173,6 +209,77 @@ internal class FluidCloudHooks(
                 message = "流体云图标替换失败，保留插件原始图标",
                 cause = exception,
             )
+        }
+    }
+
+    /** 替换没发生时要能从日志看出卡在哪一步，否则只能靠猜。 */
+    private fun reportSkip(root: View, reason: String, extra: Map<String, Any?> = emptyMap()) {
+        report(
+            "流体云未替换：$reason",
+            mapOf("root" to root.javaClass.simpleName) + extra,
+        )
+    }
+
+    private fun briefTree(root: View): String {
+        val nodes = ArrayList<String>(8)
+        collect(root, 0, nodes)
+        return nodes.take(BRIEF_TREE_NODES).joinToString(" / ") { it.substringAfter('|') }
+    }
+
+    /**
+     * 包名取不到时把图标往上几层的字段打出来：模型挂在哪一层、字段叫什么，只能靠这个定位。
+     * 每棵卡片 View 只打一次，避免四次补丁重复刷屏。
+     */
+    private fun dumpAncestorsOnce(icon: View, root: View) {
+        if (!fieldDumped.add(System.identityHashCode(root))) return
+        try {
+            val lines = ArrayList<String>(5)
+            var node: View? = icon
+            var depth = 0
+            while (depth < MODEL_ANCESTORS && lines.size < MODEL_ANCESTORS) {
+                val current = node ?: break
+                val clazz = current.javaClass
+                val fields = ArrayList<String>(8)
+                try {
+                    for (field in clazz.declaredFields) {
+                        if (Modifier.isStatic(field.modifiers) || fields.size >= MODEL_FIELDS) continue
+                        field.isAccessible = true
+                        val value = runCatching { field.get(current) }.getOrNull()
+                        val text = value?.let { runCatching { it.toString() }.getOrNull() }
+                        fields += "${field.name}:${field.type.simpleName}=${text?.take(MODEL_VALUE_LENGTH) ?: "null"}"
+                    }
+                } catch (_: Exception) {
+                    // 插件类字段读不到就跳过这一层，不影响其它层。
+                }
+                if (fields.isNotEmpty()) lines += "${clazz.simpleName}{${fields.joinToString(", ")}}"
+                node = current.parent as? View
+                depth++
+            }
+            report(
+                "流体云模型字段（未取到包名）",
+                mapOf("root" to root.javaClass.simpleName, "fields" to lines.joinToString(" | ")),
+            )
+        } catch (exception: Exception) {
+            diagnostics.runtimeFailure(
+                scope = "fluid_cloud:dump_fields",
+                message = "流体云模型字段探测失败",
+                cause = exception,
+            )
+        }
+    }
+
+    /** SystemUI 的 Application：主题图标引擎只在这个上下文里认得出桌面图标。 */
+    private fun hostContext(): Context? {
+        hostApplication?.let { return it }
+        return try {
+            val application = Class.forName("android.app.ActivityThread")
+                .getDeclaredMethod("currentApplication")
+                .apply { isAccessible = true }
+                .invoke(null) as? Context
+            if (application != null) hostApplication = application
+            application
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -231,7 +338,7 @@ internal class FluidCloudHooks(
                 // 插件清空图标（传 null）时不要补：那是卡片正在收起，补上会闪出一个图标。
                 if (incoming is Drawable) {
                     val packageName = iconPackages[view]
-                    val context = view.context?.applicationContext
+                    val context = hostContext() ?: view.context?.applicationContext
                     val drawable = if (packageName != null && context != null) {
                         replacementFor(context, packageName, configuration.snapshot)
                     } else {
@@ -273,9 +380,13 @@ internal class FluidCloudHooks(
 
     // ------------------------------------------------------------------ 包名
 
-    /** 从图标 View 往上找最近的、挂得住模型的那一层；双卡胶囊的左右图标按位置取对应包名。 */
+    /**
+     * 从图标 View 往上找最近的、挂得住模型的那一层；双卡胶囊的左右图标按位置取对应包名。
+     *
+     * 这里不能先查 `iconPackages` 的缓存：插件的卡片 View 是复用的，同一个 View 换一张卡之后
+     * 旧包名还留在表里，先查缓存会一直贴错应用。缓存只在解析不出包名时兜底。
+     */
     private fun packageFor(icon: View): String? {
-        iconPackages[icon]?.let { return it }
         var current: View? = icon
         var depth = 0
         while (current != null && depth < MAX_ANCESTORS) {
@@ -287,7 +398,7 @@ internal class FluidCloudHooks(
             current = current.parent as? View
             depth++
         }
-        return null
+        return iconPackages[icon]
     }
 
     private fun iconIndexIn(icon: View, ancestor: View, size: Int): Int {
@@ -298,7 +409,6 @@ internal class FluidCloudHooks(
 
     /** 模型里的包名只出现在 key 上：`0|com.jingdong.app.mall|935079901|null|10489`。 */
     private fun packagesOf(view: View): List<String> {
-        viewPackages[view]?.let { return it }
         val result = LinkedHashSet<String>()
         try {
             harvestFromObject(view, 0, result)
@@ -309,9 +419,7 @@ internal class FluidCloudHooks(
                 cause = exception,
             )
         }
-        val packages = result.toList()
-        viewPackages[view] = packages
-        return packages
+        return result.toList()
     }
 
     private fun harvestFromObject(target: Any, depth: Int, out: MutableSet<String>) {
@@ -384,13 +492,13 @@ internal class FluidCloudHooks(
 
     private fun isPlatformClass(name: String): Boolean = PLATFORM_PREFIXES.any { name.startsWith(it) }
 
-    /** 图标控件：可见、且 id 是流体云约定的那几个名字。 */
+    /** 图标控件：id 是流体云约定的那几个名字，且当前真的在显示（可见或已经有图）。 */
     private fun collectIconViews(root: View): List<ImageView> {
         val result = ArrayList<ImageView>(2)
         fun walk(view: View, depth: Int) {
             if (depth > MAX_NODES || result.size >= MAX_ICONS) return
-            if (view is ImageView && view.visibility == View.VISIBLE &&
-                resourceName(view, view.id) in ICON_IDS
+            if (view is ImageView && resourceName(view, view.id) in ICON_IDS &&
+                (view.visibility == View.VISIBLE || view.drawable != null)
             ) {
                 result += view
             }
@@ -612,6 +720,12 @@ internal class FluidCloudHooks(
         const val MAX_MODEL_SUPER = 3
         const val MAX_TEXT_LENGTH = 16
         const val MAX_VALUE_LENGTH = 120
+
+        /** 诊断用的短输出上限：日志里一行看完，不要整棵树。 */
+        const val BRIEF_TREE_NODES = 12
+        const val MODEL_ANCESTORS = 5
+        const val MODEL_FIELDS = 8
+        const val MODEL_VALUE_LENGTH = 60
 
         /** `SeedlingCard` 上的关键 getter（部分带 `$seedling_...` 后缀，按前缀匹配）。 */
         val CARD_GETTERS =
