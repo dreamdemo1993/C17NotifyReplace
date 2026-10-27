@@ -200,10 +200,14 @@ internal class FluidCloudHooks(
      */
     private fun iconTargets(icon: ImageView): List<ImageView> {
         val idName = resourceName(icon, icon.id)
-        if (idName !in NESTED_ICON_IDS || icon !is ViewGroup) return listOf(icon)
+        if (idName !in NESTED_ICON_IDS) return listOf(icon)
+        // ImageView 与 ViewGroup 是兄弟类型，Kotlin 会把 `icon is ViewGroup` 判成常量检查，
+        // 这里先退到 View 再判，运行时对插件里的 Lottie 容器才成立。
+        val asView: View = icon
+        if (asView !is ViewGroup) return listOf(icon)
         val targets = ArrayList<ImageView>(2)
         targets += icon
-        if (icon.childCount > 0) (icon.getChildAt(0) as? ImageView)?.let { targets += it }
+        if (asView.childCount > 0) (asView.getChildAt(0) as? ImageView)?.let { targets += it }
         return targets
     }
 
