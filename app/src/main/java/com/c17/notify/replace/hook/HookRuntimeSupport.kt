@@ -146,5 +146,4 @@ private val TRACED_EVENTS = setOf(
     DiagnosticEvent.GameAssistantIconSkipped,
     DiagnosticEvent.GameAssistantIconSelfCheck,
     DiagnosticEvent.ThemeIconBlank,
-    DiagnosticEvent.FluidCloudProbe,
 )

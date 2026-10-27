@@ -124,26 +124,6 @@ internal data class EntryUseAppIconMembers(
     val notificationEntryGetSbn: Method,
 )
 
-/**
- * ColorOS 17 流体云（Pantanal Seedling）。
- *
- * 卡片本体由 `com.android.systemui.plugins.statusbar.SeedlingPlugin` 的实现渲染。插件 APK 被
- * 加载进 SystemUI 进程，但它的类不在 SystemUI dex 里，所以这里只能挂 SystemUI 侧的容器
- * （`CapsulePluginContainer`）与插件通信 Bundle 的出口。
- */
-internal data class FluidCloudMembers(
-    /** `CapsulePluginContainer.onAttachedToWindow()` — 胶囊视图进入窗口，插件随后填充子树。 */
-    val containerAttached: Method,
-    /** `CapsulePluginContainerController.onPluginAdded(...)` — 插件实例装上的时刻。 */
-    val pluginAdded: Method?,
-    /** `SeedlingCardCache.onShow/onUpdateData/onHide(Context, SeedlingCard, ...)` — 卡片的生命周期。 */
-    val cardCallbacks: List<Method>,
-    /** `ViewGroup.addView(View, int, LayoutParams)` — 插件 View 进入宿主容器的唯一必经点。 */
-    val addView: Method?,
-    /** `SeedlingPluginCallUtils.getBundle(...)` 的全部重载，用来观察卡片数据的键。 */
-    val pluginBundles: List<Method>,
-)
-
 internal data class LockScreenCapsuleMembers(
     val notificationIconDataCtors: List<java.lang.reflect.Constructor<*>>,
     val notificationEntryGetSbn: Method,
@@ -831,77 +811,13 @@ internal object SystemUiMembers {
         return ThemeChangeMembers(applyConfigurationToResources = method)
     }
 
-    fun resolveUseAppIcon(classLoader: ClassLoader): Method? {
-        val clazz = loadOptional(OPLUS_SMALL_ICON_UTIL, classLoader) ?: return null
+    fun resolveUseAppIcon(classLoader: ClassLoader): Method? {        val clazz = loadOptional(OPLUS_SMALL_ICON_UTIL, classLoader) ?: return null
         return Reflection.findMethodReturning(
             clazz,
             "useAppIconForSmallIcon",
             Boolean::class.javaPrimitiveType!!,
             android.app.Notification::class.java,
         )
-    }
-
-    fun resolveFluidCloud(
-        classLoader: ClassLoader,
-        diagnostics: Diagnostics,
-    ): FluidCloudMembers? {
-        val container = loadOptional(FLUID_CLOUD_CAPSULE_CONTAINER, classLoader) ?: run {
-            diagnostics.memberMissing(
-                scope = "systemui:fluid_cloud:container",
-                message = "未找到流体云胶囊容器，状态栏/下拉栏的流体云图标保持 ColorOS 原样",
-            )
-            return null
-        }
-        val attached = Reflection.findAnyMethod(container, "onAttachedToWindow", Void.TYPE) ?: run {
-            diagnostics.memberMissing(
-                scope = "systemui:fluid_cloud:attach",
-                message = "流体云胶囊容器没有 onAttachedToWindow，跳过流体云探测",
-            )
-            return null
-        }
-        // 插件通信入口只是附加信息：拿不到也不影响后续替换，因此不报缺失。
-        val pluginBundles = loadOptional(FLUID_CLOUD_PLUGIN_CALL_UTILS, classLoader)
-            ?.declaredMethods
-            ?.filter { it.name == "getBundle" && android.os.Bundle::class.java.isAssignableFrom(it.returnType) }
-            ?.onEach { it.isAccessible = true }
-            ?.sortedBy { it.parameterTypes.size }
-            .orEmpty()
-        val pluginAdded = loadOptional(FLUID_CLOUD_CAPSULE_CONTAINER_CONTROLLER, classLoader)
-            ?.let { Reflection.findAnyMethod(it, "onPluginAdded") }
-        // 卡片生命周期是定位"当前这张卡属于哪个 app"的唯一可靠入口：SeedlingCard 自带
-        // clientName / serviceId，而插件 View 本身不暴露包名。
-        val cardCallbacks = loadOptional(FLUID_CLOUD_CARD_CACHE, classLoader)
-            ?.declaredMethods
-            ?.filter {
-                it.name in FLUID_CLOUD_CARD_CALLBACKS &&
-                    it.parameterTypes.size >= 2 &&
-                    android.content.Context::class.java.isAssignableFrom(it.parameterTypes[0])
-            }
-            ?.onEach { it.isAccessible = true }
-            ?.toList()
-            .orEmpty()
-        return FluidCloudMembers(
-            containerAttached = attached,
-            pluginAdded = pluginAdded,
-            cardCallbacks = cardCallbacks,
-            addView = fluidCloudAddView(),
-            pluginBundles = pluginBundles,
-        )
-    }
-
-    /**
-     * `addView(View, int, LayoutParams)` 是 ViewGroup 的最终实现，其余重载都会转到它。框架方法
-     * 直接取即可，不需要目标进程里的类。
-     */
-    private fun fluidCloudAddView(): Method? = try {
-        android.view.ViewGroup::class.java.getDeclaredMethod(
-            "addView",
-            android.view.View::class.java,
-            Int::class.javaPrimitiveType!!,
-            android.view.ViewGroup.LayoutParams::class.java,
-        ).apply { isAccessible = true }
-    } catch (_: Exception) {
-        null
     }
 
     fun resolveLockScreenCapsule(
@@ -1481,15 +1397,6 @@ internal object SystemUiMembers {
         "com.oplus.systemui.statusbar.notification.util.OplusNotificationSmallIconUtil"
     /** ColorOS 进程应用新配置的通用注入类，主题/图标样式变化只能在这里看到标志位。 */
     private const val OPLUS_COMMON_INJECTOR = "oplus.android.OplusCommonInjector"
-    /** 流体云（Pantanal Seedling）在 SystemUI 侧的胶囊容器。 */
-    private const val FLUID_CLOUD_CAPSULE_CONTAINER =
-        "com.oplus.systemui.statusbar.seeding.CapsulePluginContainer"
-    private const val FLUID_CLOUD_CAPSULE_CONTAINER_CONTROLLER =
-        "com.oplus.systemui.statusbar.seeding.CapsulePluginContainerController"
-    private const val FLUID_CLOUD_CARD_CACHE = "com.oplus.pantanal.seedling.cache.SeedlingCardCache"
-    private val FLUID_CLOUD_CARD_CALLBACKS = setOf("onShow", "onHide", "onUpdateData", "onHostChange")
-    private const val FLUID_CLOUD_PLUGIN_CALL_UTILS =
-        "com.oplus.systemui.statusbar.seeding.SeedlingPluginCallUtils"
     private const val AOD_NOTIFICATION_LAYOUT =
         "com.oplus.systemui.aod.aodclock.off.notification.NotificationLayout"
     private const val LOCK_SCREEN_NOTIFICATION_ICON_DATA =
