@@ -1425,6 +1425,17 @@ internal class NotificationPanelHooks(
                         icon.applyRenderPlan(plan, target)
                     }
                 }
+                if (target == PanelIconTarget.Header) {
+                    // A new notification in the same group makes the host re-lay out every sibling
+                    // row and repaint their icons from its own cache, without calling back into any
+                    // of the hooks above. The timed ladder that [verifyIconAfterWrite] used to be is
+                    // long over by then, so those rows dropped back to the raw app icon until the
+                    // next bind — the "拼多多来了新消息，旧消息的图标变回原生" report. The guard
+                    // holds the plan for as long as the row lives and only steps in when what is on
+                    // screen is measurably the host's own placeholder, so a late contact photo still
+                    // wins.
+                    guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot, plan)
+                }
             }
         } catch (exception: Exception) {
             diagnostics.runtimeFailure(
@@ -1757,13 +1768,14 @@ internal class NotificationPanelHooks(
         row: Any?,
         sbn: StatusBarNotification,
         snapshot: RuntimeSnapshot,
+        plan: NotificationIconResolver.PanelIconRenderPlan? = null,
     ) {
         val context = icon.context
         if (HostAvatarPresence.evaluate(context, sbn).renderable) return
         // No themed lookup here on purpose: the engine is cold, that is why this path is running
         // at all. The guard resolves the themed icon lazily on each draw instead.
         headerPlaceholderGuards
-            .put(icon, HeaderPlaceholderGuard(icon, row, sbn, snapshot))
+            .put(icon, HeaderPlaceholderGuard(icon, row, sbn, snapshot, plan))
             ?.stop()
         headerPlaceholderGuards[icon]?.start()
     }
@@ -1773,6 +1785,14 @@ internal class NotificationPanelHooks(
         private val row: Any?,
         private val sbn: StatusBarNotification,
         private val snapshot: RuntimeSnapshot,
+        /**
+         * The plan this row was replaced with, when there was one. Holding the plan is what lets
+         * the guard outlive the bind: the host re-paints every row of a group whenever a sibling
+         * notification arrives, and without a guard the rows that were already replaced fall back
+         * to the raw app icon until the next bind (report: "新消息来了以后旧消息的图标变回原生了").
+         * A null plan keeps the old cold-start behaviour and resolves the theme icon lazily.
+         */
+        private val plan: NotificationIconResolver.PanelIconRenderPlan? = null,
     ) : ViewTreeObserver.OnPreDrawListener, View.OnAttachStateChangeListener {
 
         private var observer: ViewTreeObserver? = null
@@ -1781,7 +1801,7 @@ internal class NotificationPanelHooks(
         private var stopped = false
 
         /** Resolved on first success; the theme engine can be cold for the first seconds. */
-        private var themed: Drawable? = null
+        private var themed: Drawable? = plan?.drawable
 
         /** Draw passes forced while the themed icon is still unresolved. */
         private var nudges = 0
@@ -1870,9 +1890,13 @@ internal class NotificationPanelHooks(
                     occurrence = OccurrencePolicy.Once("header_placeholder_guard:${sbn.key}"),
                 )
             }
-            icon.clearColorFilter()
-            icon.imageTintList = null
-            icon.setImageDrawable(themedNow)
+            if (plan != null) {
+                icon.applyRenderPlan(plan, PanelIconTarget.Header)
+            } else {
+                icon.clearColorFilter()
+                icon.imageTintList = null
+                icon.setImageDrawable(themedNow)
+            }
             return true
         }
 
