@@ -136,6 +136,8 @@ internal data class FluidCloudMembers(
     val containerAttached: Method,
     /** `CapsulePluginContainerController.onPluginAdded(...)` — 插件实例装上的时刻。 */
     val pluginAdded: Method?,
+    /** `SeedlingCardCache.onShow/onUpdateData/onHide(Context, SeedlingCard, ...)` — 卡片的生命周期。 */
+    val cardCallbacks: List<Method>,
     /** `SeedlingPluginCallUtils.getBundle(...)` 的全部重载，用来观察卡片数据的键。 */
     val pluginBundles: List<Method>,
 )
@@ -864,9 +866,22 @@ internal object SystemUiMembers {
             .orEmpty()
         val pluginAdded = loadOptional(FLUID_CLOUD_CAPSULE_CONTAINER_CONTROLLER, classLoader)
             ?.let { Reflection.findAnyMethod(it, "onPluginAdded") }
+        // 卡片生命周期是定位"当前这张卡属于哪个 app"的唯一可靠入口：SeedlingCard 自带
+        // clientName / serviceId，而插件 View 本身不暴露包名。
+        val cardCallbacks = loadOptional(FLUID_CLOUD_CARD_CACHE, classLoader)
+            ?.declaredMethods
+            ?.filter {
+                it.name in FLUID_CLOUD_CARD_CALLBACKS &&
+                    it.parameterTypes.size >= 2 &&
+                    android.content.Context::class.java.isAssignableFrom(it.parameterTypes[0])
+            }
+            ?.onEach { it.isAccessible = true }
+            ?.toList()
+            .orEmpty()
         return FluidCloudMembers(
             containerAttached = attached,
             pluginAdded = pluginAdded,
+            cardCallbacks = cardCallbacks,
             pluginBundles = pluginBundles,
         )
     }
@@ -1453,6 +1468,8 @@ internal object SystemUiMembers {
         "com.oplus.systemui.statusbar.seeding.CapsulePluginContainer"
     private const val FLUID_CLOUD_CAPSULE_CONTAINER_CONTROLLER =
         "com.oplus.systemui.statusbar.seeding.CapsulePluginContainerController"
+    private const val FLUID_CLOUD_CARD_CACHE = "com.oplus.pantanal.seedling.cache.SeedlingCardCache"
+    private val FLUID_CLOUD_CARD_CALLBACKS = setOf("onShow", "onHide", "onUpdateData", "onHostChange")
     private const val FLUID_CLOUD_PLUGIN_CALL_UTILS =
         "com.oplus.systemui.statusbar.seeding.SeedlingPluginCallUtils"
     private const val AOD_NOTIFICATION_LAYOUT =

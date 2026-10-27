@@ -38,6 +38,7 @@ internal class FluidCloudHooks(
     private val attachProbes = AtomicInteger()
     private val bundleProbes = AtomicInteger()
     private val pluginProbes = AtomicInteger()
+    private val cardProbes = AtomicInteger()
 
     fun install() {
         hooks.install(members.containerAttached, "systemui.fluid_cloud.container") { chain ->
@@ -61,6 +62,52 @@ internal class FluidCloudHooks(
                 probePlugin(chain.args)
                 result
             }
+        }
+
+        for (method in members.cardCallbacks) {
+            hooks.install(method, "systemui.fluid_cloud.card_${method.name}") { chain ->
+                val result = chain.proceed()
+                probeCard(method.name, chain.args)
+                result
+            }
+        }
+    }
+
+    /**
+     * 插件 View 本身不带包名，卡片对象才是数据源：`SeedlingCard` 的 clientName 就是卡片所属应用。
+     */
+    private fun probeCard(callback: String, args: Array<Any?>) {
+        if (cardProbes.incrementAndGet() > MAX_CARD_PROBES) return
+        try {
+            val card = args.getOrNull(1) ?: return
+            val attributes = mutableMapOf<String, Any?>(
+                "callback" to callback,
+                "card_class" to card.javaClass.name,
+            )
+            for (getter in CARD_GETTERS) {
+                val method = card.javaClass.declaredMethods.firstOrNull {
+                    it.name.startsWith(getter) && it.parameterTypes.isEmpty()
+                } ?: continue
+                method.isAccessible = true
+                attributes[getter] = try {
+                    method.invoke(card)?.toString()?.take(MAX_VALUE_LENGTH)
+                } catch (exception: Exception) {
+                    "error:${exception.javaClass.simpleName}"
+                }
+            }
+            diagnostics.report(
+                level = DiagnosticLevel.Debug,
+                event = DiagnosticEvent.FluidCloudProbe,
+                message = "流体云卡片生命周期 $callback",
+                attributes = attributes,
+                occurrence = OccurrencePolicy.Always,
+            )
+        } catch (exception: Exception) {
+            diagnostics.runtimeFailure(
+                scope = "fluid_cloud:probe_card",
+                message = "流体云卡片信息探测失败",
+                cause = exception,
+            )
         }
     }
 
@@ -240,8 +287,12 @@ internal class FluidCloudHooks(
         const val MAX_CONTAINER_PROBES = 6
         const val MAX_BUNDLE_PROBES = 12
         const val MAX_PLUGIN_PROBES = 4
+        const val MAX_CARD_PROBES = 20
         const val MAX_NODES = 60
         const val MAX_TEXT_LENGTH = 16
         const val MAX_VALUE_LENGTH = 80
+
+        /** `SeedlingCard` 上的关键 getter（部分带 `$seedling_...` 后缀，按前缀匹配）。 */
+        val CARD_GETTERS = listOf("getClientName", "getServiceId", "getWidgetCode", "getHost", "getPageId")
     }
 }
