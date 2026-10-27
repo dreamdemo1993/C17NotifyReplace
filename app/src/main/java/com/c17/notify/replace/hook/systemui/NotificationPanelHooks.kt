@@ -1530,15 +1530,30 @@ internal class NotificationPanelHooks(
         snapshot: RuntimeSnapshot,
         reapply: () -> Unit,
     ) {
-        groupIconTakeovers.put(icon, IconTakeover(icon, row, sbn, snapshot, reapply))?.stop()
+        // Rows answer null until the host binds the entry; that must not stop the guard, so the
+        // provider is allowed to return null and is re-asked on every frame.
+        keepGroupSummaryIcon(icon, sbn, snapshot, reapply, currentSbn = {
+            runCatching { row?.let { statusBarNotificationFromRow(it) } }.getOrNull()
+        })
+    }
+
+    private fun keepGroupSummaryIcon(
+        icon: ImageView,
+        sbn: StatusBarNotification,
+        snapshot: RuntimeSnapshot,
+        reapply: () -> Unit,
+        currentSbn: () -> StatusBarNotification?,
+    ) {
+        groupIconTakeovers.put(icon, IconTakeover(icon, sbn, snapshot, currentSbn, reapply))?.stop()
         groupIconTakeovers[icon]?.start()
     }
 
     private inner class IconTakeover(
         private val icon: ImageView,
-        private val row: Any?,
         private val sbn: StatusBarNotification,
         private val snapshot: RuntimeSnapshot,
+        /** Re-read on every frame: the row may not be bound yet, and a null answer is not an exit. */
+        private val currentSbn: () -> StatusBarNotification?,
         private val reapply: () -> Unit,
     ) : ViewTreeObserver.OnPreDrawListener, View.OnAttachStateChangeListener {
 
@@ -1576,19 +1591,18 @@ internal class NotificationPanelHooks(
          */
         fun rearmUnder(latest: RuntimeSnapshot) {
             stop()
-            val currentSbn = runCatching { row?.let { statusBarNotificationFromRow(it) } }.getOrNull()
-                ?: return
-            if (currentSbn.key != sbn.key) return
+            val latestSbn = runCatching { currentSbn() }.getOrNull() ?: return
+            if (latestSbn.key != sbn.key) return
             val plan = runCatching {
                 latest.resolver.resolveGroupSummaryIconPlan(
                     context = icon.context,
-                    sbn = currentSbn,
-                    originalSmallIcon = currentSbn.originalSmallIcon(diagnostics, latest.revision),
+                    sbn = latestSbn,
+                    originalSmallIcon = latestSbn.originalSmallIcon(diagnostics, latest.revision),
                 )
             }.getOrNull() ?: return
             writeGroupSummaryPlan(icon, plan)
-            keepGroupSummaryIcon(icon, row, currentSbn, latest) { writeGroupSummaryPlan(icon, plan) }
-            reportGroupSummaryAnchor(icon, row, currentSbn, "snapshotReload")
+            keepGroupSummaryIcon(icon, latestSbn, latest, { writeGroupSummaryPlan(icon, plan) }, currentSbn)
+            reportGroupSummaryAnchor(icon, null, latestSbn, "snapshotReload")
         }
 
         override fun onPreDraw(): Boolean {
@@ -1601,7 +1615,7 @@ internal class NotificationPanelHooks(
                 rearmUnder(configuration.snapshot)
                 return true
             }
-            val key = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }.getOrNull()
+            val key = runCatching { currentSbn()?.key }.getOrNull()
             // A freshly inflated row answers null here for its first frames: the host binds the entry
             // asynchronously, so [statusBarNotificationFromRow] finds nothing yet. Reading that as
             // "the row now shows something else" stopped the guard before the row had ever drawn,
@@ -1614,11 +1628,15 @@ internal class NotificationPanelHooks(
                 return true
             }
             val expected = applied
-            if (expected == null) {
-                stop()
-                return true
-            }
-            if (icon.drawable === expected) return true
+            val current = icon.drawable
+            // `applied == null` means this guard was created before the host had put any artwork in
+            // the view — the collapsed-group badge is inflated 0x0 while the shade is closed, which
+            // is exactly when notifications arrive. Stopping there handed the row back to the host
+            // for the rest of the session: the badge was painted with the raw app icon once the
+            // shade laid it out, and only the *next* notification update re-ran the injection —
+            // the "first notification after a restart keeps the original icon, the next one is
+            // fine" report. Adopt whatever is in the slot and only react to later swaps.
+            if (current === expected) return true
             // Never hand the row back to the host. Giving up used to be the only way out of a
             // fight loop, but the host's last write is what stays on screen: the row then keeps a
             // blank white composition until SystemUI restarts, which is exactly the "聚合图标又
@@ -2050,6 +2068,23 @@ internal class NotificationPanelHooks(
             }
             iconView.applyRenderPlan(plan, PanelIconTarget.OplusGroupSummary)
             reportGroupSummaryAnchor(iconView, null, sbn, "entryIconDrawable")
+            // This is the view the collapsed row actually paints. `attachCollapsedGroupBadge` hands
+            // over a different instance (0x0 and detached while the shade is closed), so the guard
+            // installed over there watches a view nobody draws: `GroupIconManager` repainted this
+            // one with the raw app icon and nothing took it back until the next notification update
+            // re-ran the injection — the "first notification after a restart shows the original
+            // icon, the next one is fine" report.
+            keepGroupSummaryIcon(
+                icon = iconView,
+                sbn = sbn,
+                snapshot = snapshot,
+                reapply = { writeGroupSummaryPlan(iconView, plan) },
+                currentSbn = {
+                    runCatching {
+                        members.notificationEntryGetSbn.invoke(entry) as? StatusBarNotification
+                    }.getOrNull()
+                },
+            )
         } catch (exception: Exception) {
             diagnostics.runtimeFailure(
                 scope = "panel:replace_icon:${PanelIconTarget.OplusGroupSummary.diagnosticName}",
