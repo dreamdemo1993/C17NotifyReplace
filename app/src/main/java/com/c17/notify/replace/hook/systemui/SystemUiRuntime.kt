@@ -171,6 +171,17 @@ internal class SystemUiRuntime(
                 ).install()
             }
         }
+
+        // 流体云（状态栏胶囊 / 下拉栏卡片）由 Seedling 插件渲染，和通知行是完全不同的一条链路。
+        installFeature("fluid_cloud") {
+            SystemUiMembers.resolveFluidCloud(classLoader, diagnostics)?.let { members ->
+                FluidCloudHooks(
+                    hooks = hooks,
+                    diagnostics = diagnostics,
+                    members = members,
+                ).install()
+            }
+        }
     }
 
     private inline fun runPublishedTask(

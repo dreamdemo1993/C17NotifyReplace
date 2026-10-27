@@ -124,6 +124,22 @@ internal data class EntryUseAppIconMembers(
     val notificationEntryGetSbn: Method,
 )
 
+/**
+ * ColorOS 17 流体云（Pantanal Seedling）。
+ *
+ * 卡片本体由 `com.android.systemui.plugins.statusbar.SeedlingPlugin` 的实现渲染。插件 APK 被
+ * 加载进 SystemUI 进程，但它的类不在 SystemUI dex 里，所以这里只能挂 SystemUI 侧的容器
+ * （`CapsulePluginContainer`）与插件通信 Bundle 的出口。
+ */
+internal data class FluidCloudMembers(
+    /** `CapsulePluginContainer.onAttachedToWindow()` — 胶囊视图进入窗口，插件随后填充子树。 */
+    val containerAttached: Method,
+    /** `CapsulePluginContainerController.onPluginAdded(...)` — 插件实例装上的时刻。 */
+    val pluginAdded: Method?,
+    /** `SeedlingPluginCallUtils.getBundle(...)` 的全部重载，用来观察卡片数据的键。 */
+    val pluginBundles: List<Method>,
+)
+
 internal data class LockScreenCapsuleMembers(
     val notificationIconDataCtors: List<java.lang.reflect.Constructor<*>>,
     val notificationEntryGetSbn: Method,
@@ -811,12 +827,47 @@ internal object SystemUiMembers {
         return ThemeChangeMembers(applyConfigurationToResources = method)
     }
 
-    fun resolveUseAppIcon(classLoader: ClassLoader): Method? {        val clazz = loadOptional(OPLUS_SMALL_ICON_UTIL, classLoader) ?: return null
+    fun resolveUseAppIcon(classLoader: ClassLoader): Method? {
+        val clazz = loadOptional(OPLUS_SMALL_ICON_UTIL, classLoader) ?: return null
         return Reflection.findMethodReturning(
             clazz,
             "useAppIconForSmallIcon",
             Boolean::class.javaPrimitiveType!!,
             android.app.Notification::class.java,
+        )
+    }
+
+    fun resolveFluidCloud(
+        classLoader: ClassLoader,
+        diagnostics: Diagnostics,
+    ): FluidCloudMembers? {
+        val container = loadOptional(FLUID_CLOUD_CAPSULE_CONTAINER, classLoader) ?: run {
+            diagnostics.memberMissing(
+                scope = "systemui:fluid_cloud:container",
+                message = "未找到流体云胶囊容器，状态栏/下拉栏的流体云图标保持 ColorOS 原样",
+            )
+            return null
+        }
+        val attached = Reflection.findAnyMethod(container, "onAttachedToWindow", Void.TYPE) ?: run {
+            diagnostics.memberMissing(
+                scope = "systemui:fluid_cloud:attach",
+                message = "流体云胶囊容器没有 onAttachedToWindow，跳过流体云探测",
+            )
+            return null
+        }
+        // 插件通信入口只是附加信息：拿不到也不影响后续替换，因此不报缺失。
+        val pluginBundles = loadOptional(FLUID_CLOUD_PLUGIN_CALL_UTILS, classLoader)
+            ?.declaredMethods
+            ?.filter { it.name == "getBundle" && android.os.Bundle::class.java.isAssignableFrom(it.returnType) }
+            ?.onEach { it.isAccessible = true }
+            ?.sortedBy { it.parameterTypes.size }
+            .orEmpty()
+        val pluginAdded = loadOptional(FLUID_CLOUD_CAPSULE_CONTAINER_CONTROLLER, classLoader)
+            ?.let { Reflection.findAnyMethod(it, "onPluginAdded") }
+        return FluidCloudMembers(
+            containerAttached = attached,
+            pluginAdded = pluginAdded,
+            pluginBundles = pluginBundles,
         )
     }
 
@@ -1397,6 +1448,13 @@ internal object SystemUiMembers {
         "com.oplus.systemui.statusbar.notification.util.OplusNotificationSmallIconUtil"
     /** ColorOS 进程应用新配置的通用注入类，主题/图标样式变化只能在这里看到标志位。 */
     private const val OPLUS_COMMON_INJECTOR = "oplus.android.OplusCommonInjector"
+    /** 流体云（Pantanal Seedling）在 SystemUI 侧的胶囊容器。 */
+    private const val FLUID_CLOUD_CAPSULE_CONTAINER =
+        "com.oplus.systemui.statusbar.seeding.CapsulePluginContainer"
+    private const val FLUID_CLOUD_CAPSULE_CONTAINER_CONTROLLER =
+        "com.oplus.systemui.statusbar.seeding.CapsulePluginContainerController"
+    private const val FLUID_CLOUD_PLUGIN_CALL_UTILS =
+        "com.oplus.systemui.statusbar.seeding.SeedlingPluginCallUtils"
     private const val AOD_NOTIFICATION_LAYOUT =
         "com.oplus.systemui.aod.aodclock.off.notification.NotificationLayout"
     private const val LOCK_SCREEN_NOTIFICATION_ICON_DATA =
