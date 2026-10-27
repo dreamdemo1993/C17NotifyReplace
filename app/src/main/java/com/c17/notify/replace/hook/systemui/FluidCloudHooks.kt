@@ -137,7 +137,6 @@ internal class FluidCloudHooks(
             val loader = plugin?.javaClass?.classLoader
             val methods = plugin?.javaClass?.declaredMethods
                 ?.map { it.name }
-                ?.filter { name -> INTEREST_KEYWORDS.any { name.contains(it, ignoreCase = true) } }
                 ?.distinct()
                 ?.sorted()
                 ?.take(MAX_METHODS)
@@ -165,6 +164,11 @@ internal class FluidCloudHooks(
 
     private fun classLoaderPaths(loader: ClassLoader?): String {
         if (loader == null) return "null"
+        // OPlusPluginClassLoader 的 toString 里带 APK 绝对路径，比反射 dexElements 更可靠。
+        return loader.toString().take(MAX_VALUE_LENGTH) + " | " + dexPaths(loader)
+    }
+
+    private fun dexPaths(loader: ClassLoader): String {
         return try {
             val pathList = Class.forName("dalvik.system.BaseDexClassLoader")
                 .getDeclaredField("pathList")
@@ -212,6 +216,126 @@ internal class FluidCloudHooks(
         )
         for (delay in PROBE_DELAYS_MILLIS) {
             mainHandler.postDelayed({ dumpTree(child, label, delay) }, delay)
+        }
+        // 卡片属于哪个应用只能从插件侧数据得到：先看 View 的 tag 和挂在它上面的模型对象。
+        mainHandler.postDelayed({ dumpModel(child, label) }, PROBE_DELAYS_MILLIS.last())
+    }
+
+    /**
+     * 插件渲染时不带包名，所以找卡片 View 上挂的模型对象（tag 或字段），把它的可读字段打出来。
+     * 只要模型里有 packageName / clientName，就能接上模块已有的规则表。
+     */
+    private fun dumpModel(root: View, source: String) {
+        try {
+            val lines = ArrayList<String>(MAX_MODEL_LINES)
+            appendModel(lines, "tag", root.tag, 0)
+            collectModelFields(lines, root, 0)
+            collectIconViewClasses(lines, root)
+            lines.forEach { line ->
+                diagnostics.report(
+                    level = DiagnosticLevel.Debug,
+                    event = DiagnosticEvent.FluidCloudProbe,
+                    message = "流体云卡片模型[$source] $line",
+                    attributes = mapOf("line" to line, "source" to source),
+                    occurrence = OccurrencePolicy.Always,
+                )
+            }
+        } catch (exception: Exception) {
+            diagnostics.runtimeFailure(
+                scope = "fluid_cloud:probe_model",
+                message = "流体云卡片模型探测失败",
+                cause = exception,
+            )
+        }
+    }
+
+    private fun appendModel(lines: MutableList<String>, label: String, value: Any?, depth: Int) {
+        if (lines.size >= MAX_MODEL_LINES) return
+        if (value == null) {
+            lines += "$label=null"
+            return
+        }
+        if (value is String || value is Number || value is Boolean) {
+            lines += "$label=${value.toString().take(MAX_VALUE_LENGTH)}"
+            return
+        }
+        lines += "$label=${value.javaClass.name} ${value.toString().take(MAX_VALUE_LENGTH)}"
+    }
+
+    /** Lottie 控件的真实类型决定能不能直接 setImageDrawable；顺便看它有哪些图标入口方法。 */
+    private fun collectIconViewClasses(lines: MutableList<String>, root: View) {
+        val found = LinkedHashMap<String, View>()
+        fun walk(view: View, depth: Int) {
+            if (depth > MAX_NODES) return
+            val idName = runCatching { resourceName(view, view.id) }.getOrNull().orEmpty()
+            if (view is ImageView && (idName.startsWith("img") || idName.contains("icon"))) {
+                found.putIfAbsent(view.javaClass.name, view)
+            }
+            if (view is ViewGroup) for (index in 0 until view.childCount) walk(view.getChildAt(index), depth + 1)
+        }
+        walk(root, 0)
+        for ((name, view) in found) {
+            val chain = buildString {
+                var clazz: Class<*>? = view.javaClass
+                var level = 0
+                while (clazz != null && level < MAX_MODEL_SUPER) {
+                    if (level > 0) append(" < ")
+                    append(clazz.name)
+                    clazz = clazz.superclass
+                    level++
+                }
+            }
+            val methods = view.javaClass.declaredMethods
+                .map { it.name }
+                .filter { method -> ICON_METHOD_KEYWORDS.any { method.contains(it, ignoreCase = true) } }
+                .distinct()
+                .sorted()
+                .take(MAX_METHODS)
+                .joinToString(",")
+            lines += "icon[$name] $chain | methods=$methods"
+        }
+    }
+
+    private fun collectModelFields(lines: MutableList<String>, target: Any, depth: Int) {
+        if (depth > MAX_MODEL_DEPTH || lines.size >= MAX_MODEL_LINES) return
+        var clazz: Class<*>? = target.javaClass
+        var level = 0
+        while (clazz != null && level < MAX_MODEL_SUPER) {
+            if (clazz.name.startsWith("android.") || clazz.name.startsWith("androidx.")) break
+            for (field in clazz.declaredFields) {
+                if (lines.size >= MAX_MODEL_LINES) return
+                if (java.lang.reflect.Modifier.isStatic(field.modifiers)) continue
+                if (field.type.isPrimitive) {
+                    runCatching {
+                        field.isAccessible = true
+                        lines += "${clazz.simpleName}.${field.name}=${field.get(target)}"
+                    }
+                    continue
+                }
+                if (field.type.name.startsWith("android.") ||
+                    field.type.name.startsWith("androidx.") ||
+                    field.type.name.startsWith("java.") ||
+                    field.type.name.startsWith("kotlin.")
+                ) {
+                    continue
+                }
+                val value = runCatching {
+                    field.isAccessible = true
+                    field.get(target)
+                }.getOrNull()
+                val label = "${clazz.simpleName}.${field.name}"
+                if (value == null) {
+                    lines += "$label=null (${field.type.simpleName})"
+                    continue
+                }
+                appendModel(lines, label, value, depth)
+                // 模型里常常再包一层 bean，往下再走一层就够定位到包名了。
+                if (depth < MAX_MODEL_DEPTH && !value.javaClass.isEnum) {
+                    collectModelFields(lines, value, depth + 1)
+                }
+            }
+            clazz = clazz.superclass
+            level++
         }
     }
 
@@ -350,6 +474,12 @@ internal class FluidCloudHooks(
         val PLUGIN_PACKAGE_PREFIXES = listOf("com.oplus.systemui.plugins.seedling")
 
         const val MAX_ANCESTORS = 6
+        const val MAX_MODEL_LINES = 40
+        const val MAX_MODEL_DEPTH = 2
+        const val MAX_MODEL_SUPER = 4
+
+        /** 图标控件上的入口方法名，用来判断插件是 setImageBitmap 还是走 Lottie 动画。 */
+        val ICON_METHOD_KEYWORDS = listOf("icon", "image", "drawable", "bitmap", "lottie", "load")
         const val MAX_CONTAINER_PROBES = 4
         const val MAX_BUNDLE_PROBES = 12
         const val MAX_PLUGIN_PROBES = 4
@@ -362,7 +492,6 @@ internal class FluidCloudHooks(
         val CARD_GETTERS = listOf("getClientName", "getServiceId", "getWidgetCode", "getHost", "getPageId")
 
         /** 插件里值得关注的入口名，用来判断能不能直接在插件侧换图标。 */
-        val INTEREST_KEYWORDS = listOf("icon", "drawable", "bitmap", "bind", "card", "image", "update")
         const val MAX_METHODS = 80
     }
 }
