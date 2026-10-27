@@ -6,6 +6,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewParent
 import android.widget.ImageView
 import android.widget.TextView
 import com.c17.notify.replace.diagnostics.DiagnosticEvent
@@ -39,13 +40,26 @@ internal class FluidCloudHooks(
     private val bundleProbes = AtomicInteger()
     private val pluginProbes = AtomicInteger()
     private val cardProbes = AtomicInteger()
+    private val probedPluginViews = java.util.Collections.synchronizedSet(HashSet<Int>())
 
     fun install() {
         hooks.install(members.containerAttached, "systemui.fluid_cloud.container") { chain ->
             val result = chain.proceed()
             val container = chain.instanceOrNull as? ViewGroup ?: return@install result
-            scheduleProbe(container)
+            scheduleProbe(container, "attach")
             result
+        }
+
+        // 胶囊/卡片不一定重新 attach 到窗口，也不一定走 CapsulePluginContainer：插件的 View 由
+        // 宿主容器 addView 进来，所以直接盯 addView，只处理插件包名下的子 View。
+        members.addView?.let { method ->
+            hooks.install(method, "systemui.fluid_cloud.add_view") { chain ->
+                val result = chain.proceed()
+                val parent = chain.instanceOrNull as? ViewGroup
+                val child = chain.args.getOrNull(0) as? View
+                if (parent != null && child != null) probePluginView(parent, child)
+                result
+            }
         }
 
         for (method in members.pluginBundles) {
@@ -121,6 +135,13 @@ internal class FluidCloudHooks(
             // onPluginAdded(SeedlingPlugin, Context)：第一个参数就是插件实例。
             val plugin = args.getOrNull(0)
             val loader = plugin?.javaClass?.classLoader
+            val methods = plugin?.javaClass?.declaredMethods
+                ?.map { it.name }
+                ?.filter { name -> INTEREST_KEYWORDS.any { name.contains(it, ignoreCase = true) } }
+                ?.distinct()
+                ?.sorted()
+                ?.take(MAX_METHODS)
+                ?.joinToString(",")
             diagnostics.report(
                 level = DiagnosticLevel.Debug,
                 event = DiagnosticEvent.FluidCloudProbe,
@@ -129,6 +150,7 @@ internal class FluidCloudHooks(
                     "plugin" to (plugin?.javaClass?.name ?: "null"),
                     "loader" to (loader?.javaClass?.name ?: "null"),
                     "dex" to classLoaderPaths(loader),
+                    "methods" to methods,
                 ),
                 occurrence = OccurrencePolicy.Always,
             )
@@ -162,18 +184,54 @@ internal class FluidCloudHooks(
         }
     }
 
-    private fun scheduleProbe(container: ViewGroup) {
+    private fun scheduleProbe(container: ViewGroup, source: String) {
         if (attachProbes.incrementAndGet() > MAX_CONTAINER_PROBES) return
         for (delay in PROBE_DELAYS_MILLIS) {
-            mainHandler.postDelayed({ dumpTree(container, delay) }, delay)
+            mainHandler.postDelayed({ dumpTree(container, source, delay) }, delay)
         }
     }
 
-    private fun dumpTree(container: ViewGroup, delay: Long) {
+    /** 只处理插件自己的 View；其它 addView 一律立即返回，避免拖慢 SystemUI 的列表更新。 */
+    private fun probePluginView(parent: ViewGroup, child: View) {
+        val name = child.javaClass.name
+        if (!PLUGIN_PACKAGE_PREFIXES.any { name.startsWith(it) }) return
+        if (!probedPluginViews.add(System.identityHashCode(child))) return
+        val label = "addView:${child.javaClass.simpleName}"
+        val parentChain = parentChain(parent)
+        diagnostics.report(
+            level = DiagnosticLevel.Debug,
+            event = DiagnosticEvent.FluidCloudProbe,
+            message = "流体云插件 View 加入容器",
+            attributes = mapOf(
+                "child" to name,
+                "parent" to parent.javaClass.name,
+                "parents" to parentChain,
+                "parent_id" to resourceName(parent, parent.id),
+            ),
+            occurrence = OccurrencePolicy.Always,
+        )
+        for (delay in PROBE_DELAYS_MILLIS) {
+            mainHandler.postDelayed({ dumpTree(child, label, delay) }, delay)
+        }
+    }
+
+    private fun parentChain(view: View): String = buildString {
+        var current: ViewParent? = view.parent
+        var depth = 0
+        while (current is View && depth < MAX_ANCESTORS) {
+            if (depth > 0) append(" < ")
+            append(current.javaClass.simpleName)
+            append('#').append(resourceName(current, current.id))
+            current = current.parent
+            depth++
+        }
+    }
+
+    private fun dumpTree(root: View, source: String, delay: Long) {
         try {
             val nodes = ArrayList<String>(MAX_NODES)
-            collect(container, 0, nodes)
-            val label = "${container.javaClass.simpleName}@${delay}ms"
+            collect(root, 0, nodes)
+            val label = "${root.javaClass.simpleName}/$source@${delay}ms"
             nodes.forEachIndexed { index, node ->
                 diagnostics.report(
                     level = DiagnosticLevel.Debug,
@@ -193,7 +251,7 @@ internal class FluidCloudHooks(
                 message = "流体云视图树[$label] 共 ${nodes.size} 个节点",
                 attributes = mapOf(
                     "nodes" to nodes.size,
-                    "child_count" to container.childCount,
+                    "child_count" to (root as? ViewGroup)?.childCount,
                     "delay" to delay,
                 ),
                 occurrence = OccurrencePolicy.Always,
@@ -225,6 +283,10 @@ internal class FluidCloudHooks(
             append('#').append(resourceName(view, id))
         }
         append(' ').append(view.width).append('x').append(view.height)
+        // 屏幕坐标用来区分状态栏胶囊（y≈0）和下拉栏卡片（y 在状态栏之下）。
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        append('@').append(location[0]).append(',').append(location[1])
         if (view.visibility != View.VISIBLE) append(" vis=").append(view.visibility)
         when (view) {
             is ImageView -> {
@@ -284,7 +346,11 @@ internal class FluidCloudHooks(
         /** 插件把 View 加进容器、卡片渲染完成各有延迟，两个时间点各拍一次。 */
         val PROBE_DELAYS_MILLIS = longArrayOf(600L, 1_600L)
 
-        const val MAX_CONTAINER_PROBES = 6
+        /** 流体云插件的类名前缀：只有这些 View 值得 dump。 */
+        val PLUGIN_PACKAGE_PREFIXES = listOf("com.oplus.systemui.plugins.seedling")
+
+        const val MAX_ANCESTORS = 6
+        const val MAX_CONTAINER_PROBES = 4
         const val MAX_BUNDLE_PROBES = 12
         const val MAX_PLUGIN_PROBES = 4
         const val MAX_CARD_PROBES = 20
@@ -294,5 +360,9 @@ internal class FluidCloudHooks(
 
         /** `SeedlingCard` 上的关键 getter（部分带 `$seedling_...` 后缀，按前缀匹配）。 */
         val CARD_GETTERS = listOf("getClientName", "getServiceId", "getWidgetCode", "getHost", "getPageId")
+
+        /** 插件里值得关注的入口名，用来判断能不能直接在插件侧换图标。 */
+        val INTEREST_KEYWORDS = listOf("icon", "drawable", "bitmap", "bind", "card", "image", "update")
+        const val MAX_METHODS = 80
     }
 }

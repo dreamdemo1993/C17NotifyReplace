@@ -138,6 +138,8 @@ internal data class FluidCloudMembers(
     val pluginAdded: Method?,
     /** `SeedlingCardCache.onShow/onUpdateData/onHide(Context, SeedlingCard, ...)` — 卡片的生命周期。 */
     val cardCallbacks: List<Method>,
+    /** `ViewGroup.addView(View, int, LayoutParams)` — 插件 View 进入宿主容器的唯一必经点。 */
+    val addView: Method?,
     /** `SeedlingPluginCallUtils.getBundle(...)` 的全部重载，用来观察卡片数据的键。 */
     val pluginBundles: List<Method>,
 )
@@ -882,8 +884,24 @@ internal object SystemUiMembers {
             containerAttached = attached,
             pluginAdded = pluginAdded,
             cardCallbacks = cardCallbacks,
+            addView = fluidCloudAddView(),
             pluginBundles = pluginBundles,
         )
+    }
+
+    /**
+     * `addView(View, int, LayoutParams)` 是 ViewGroup 的最终实现，其余重载都会转到它。框架方法
+     * 直接取即可，不需要目标进程里的类。
+     */
+    private fun fluidCloudAddView(): Method? = try {
+        android.view.ViewGroup::class.java.getDeclaredMethod(
+            "addView",
+            android.view.View::class.java,
+            Int::class.javaPrimitiveType!!,
+            android.view.ViewGroup.LayoutParams::class.java,
+        ).apply { isAccessible = true }
+    } catch (_: Exception) {
+        null
     }
 
     fun resolveLockScreenCapsule(
