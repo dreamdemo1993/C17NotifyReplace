@@ -76,7 +76,7 @@ internal class FluidCloudHooks(
     /**
      * 插件 View 本身不带包名，卡片对象才是数据源：`SeedlingCard` 的 clientName 就是卡片所属应用。
      */
-    private fun probeCard(callback: String, args: Array<Any?>) {
+    private fun probeCard(callback: String, args: List<Any?>) {
         if (cardProbes.incrementAndGet() > MAX_CARD_PROBES) return
         try {
             val card = args.getOrNull(1) ?: return
@@ -115,7 +115,7 @@ internal class FluidCloudHooks(
      * 插件 APK 不在 SystemUI dex 内，只能从实例的 ClassLoader 反推它的 dex 路径；这条日志决定
      * 后续能否直接静态分析插件布局。
      */
-    private fun probePlugin(args: Array<Any?>) {
+    private fun probePlugin(args: List<Any?>) {
         if (pluginProbes.incrementAndGet() > MAX_PLUGIN_PROBES) return
         try {
             // onPluginAdded(SeedlingPlugin, Context)：第一个参数就是插件实例。
