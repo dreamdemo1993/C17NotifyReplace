@@ -196,6 +196,49 @@ internal object HostAvatarPresence {
     }
 
     /**
+     * Whether two drawables are, visually, the same picture.
+     *
+     * The header guard uses this with the artwork it saw in the slot *before* it wrote the themed
+     * icon: whatever the host paints when it repaints a row from its own cache is that artwork
+     * again, so identity-by-content says "this is host placeholder art, take the slot back"
+     * without having to name it. The appearance predicates ([looksLikeLauncherIcon],
+     * [looksBlank], [looksLikeMonochromeMask]) cannot do that on their own — ColorOS repaints
+     * `mIcon` from `Notification#smallIcon`, which for most apps is a tinted brand glyph, so it
+     * matches none of them and the guard used to read it as "host content we must not cover" and
+     * stop for good (report: the single row of a package falls back to the raw icon).
+     */
+    fun looksLikeSameArtwork(left: Drawable?, right: Drawable?): Boolean {
+        if (left == null || right == null) return false
+        if (left === right) return true
+        val difference = artworkDifference(left, right) ?: return false
+        return difference < HOSTED_PLACEHOLDER_TOLERANCE
+    }
+
+    /**
+     * Whether [drawable] is the notification's own `smallIcon` — the artwork ColorOS refills the
+     * header slot with when it has no avatar to compose.
+     *
+     * This is the refill the header guard used to misread. It is neither the launcher icon (apps
+     * ship a monochrome glyph for the status bar) nor a blank sheet nor the white mask, so all
+     * three appearance checks said "not a placeholder, leave it alone" and the guard stopped —
+     * a plain single row then sat on the raw icon until the next bind. Colors are compared first,
+     * then the alpha silhouette, because the host tints the glyph before painting it and a tinted
+     * copy no longer matches pixel-for-pixel.
+     */
+    fun looksLikeNotificationSmallIcon(
+        context: Context?,
+        sbn: StatusBarNotification?,
+        drawable: Drawable?,
+    ): Boolean {
+        if (context == null || sbn == null || drawable == null) return false
+        val smallIcon = sbn.notification?.smallIcon ?: return false
+        val loaded = runCatching { smallIcon.loadDrawable(context) }.getOrNull() ?: return false
+        artworkDifference(drawable, loaded)?.let { if (it < HOSTED_PLACEHOLDER_TOLERANCE) return true }
+        val shape = alphaDifference(drawable, loaded) ?: return false
+        return shape < HOSTED_SHAPE_TOLERANCE
+    }
+
+    /**
      * The photo the host would compose from, decoded through the very same lookup [evaluate]
      * judges. Callers must use this instead of reading `getLargeIcon()` themselves: a row is
      * classified as "has a photo" through [largeIconOf], and decoding through a narrower path is
@@ -398,6 +441,31 @@ internal object HostAvatarPresence {
         return total.toDouble() / (count * 3.0)
     }
 
+    /**
+     * Mean absolute alpha difference over the centre of two silhouettes, 0–255.
+     *
+     * The tint-proof half of [artworkDifference]: ColorOS paints the themed/raw glyph through a
+     * color filter, so the RGB values can be arbitrarily far apart while the shape — the only part
+     * that says *which* picture this is — is identical.
+     */
+    private fun alphaDifference(left: Drawable, right: Drawable): Double? {
+        val leftSample = sample(left) ?: return null
+        val rightSample = sample(right) ?: return null
+        var total = 0L
+        var count = 0
+        for (y in SAMPLE_MARGIN until SAMPLE_SIZE - SAMPLE_MARGIN) {
+            for (x in SAMPLE_MARGIN until SAMPLE_SIZE - SAMPLE_MARGIN) {
+                val index = y * SAMPLE_SIZE + x
+                val first = (leftSample[index] ushr 24) and 0xFF
+                val second = (rightSample[index] ushr 24) and 0xFF
+                total += abs(first - second).toLong()
+                count++
+            }
+        }
+        if (count == 0) return null
+        return total.toDouble() / count
+    }
+
     private fun sample(drawable: Drawable): IntArray? = try {
         val bitmap = Bitmap.createBitmap(SAMPLE_SIZE, SAMPLE_SIZE, Bitmap.Config.ARGB_8888)
         val previousBounds = Rect(drawable.bounds)
@@ -489,8 +557,14 @@ internal object HostAvatarPresence {
     /** Mean luminance above which a mostly-white mask counts as "no artwork". */
     private const val MASK_WHITE_LUMINANCE = 224.0
 
-    /** Luminance spread below which a mostly-white drawable is the host's monochrome mask, not a photo. */
+    /** Mean luminance spread below which a mostly-white drawable is the host's monochrome mask, not a photo. */
     private const val MASK_SPREAD_TOLERANCE = 48.0
+
+    /**
+     * Mean alpha difference (0–255) below which two drawables are the same silhouette. A tinted
+     * repaint of the small icon stays far under this; a photo next to a glyph never does.
+     */
+    private const val HOSTED_SHAPE_TOLERANCE = 48.0
 
     /** Keyed by notification key + large-icon identity, so a re-post is re-evaluated. */
     private val avatarDecisions = LruCache<String, Verdict>(64)

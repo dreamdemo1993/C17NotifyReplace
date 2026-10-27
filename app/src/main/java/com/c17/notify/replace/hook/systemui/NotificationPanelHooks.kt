@@ -1396,6 +1396,11 @@ internal class NotificationPanelHooks(
                 return
             }
 
+            // The artwork the host had in the slot before this write is exactly what it puts back
+            // when it repaints the row from its own cache (a new notification in the group, a
+            // collapse from group to single row, a shade re-layout). Holding on to it lets the
+            // header guard recognise that repaint by content instead of guessing what it is.
+            val hostArtwork = if (target == PanelIconTarget.Header) icon.drawable else null
             icon.applyRenderPlan(plan, target)
             if (target == PanelIconTarget.OplusGroupSummary) {
                 reportGroupSummaryAnchor(icon, row, sbn, "panelIcon")
@@ -1434,7 +1439,7 @@ internal class NotificationPanelHooks(
                     // holds the plan for as long as the row lives and only steps in when what is on
                     // screen is measurably the host's own placeholder, so a late contact photo still
                     // wins.
-                    guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot, plan)
+                    guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot, plan, hostArtwork)
                 }
             }
         } catch (exception: Exception) {
@@ -1769,13 +1774,15 @@ internal class NotificationPanelHooks(
         sbn: StatusBarNotification,
         snapshot: RuntimeSnapshot,
         plan: NotificationIconResolver.PanelIconRenderPlan? = null,
+        /** What the host had painted before the themed write; its repaint is this again. */
+        hostArtwork: Drawable? = null,
     ) {
         val context = icon.context
         if (HostAvatarPresence.evaluate(context, sbn).renderable) return
         // No themed lookup here on purpose: the engine is cold, that is why this path is running
         // at all. The guard resolves the themed icon lazily on each draw instead.
         headerPlaceholderGuards
-            .put(icon, HeaderPlaceholderGuard(icon, row, sbn, snapshot, plan))
+            .put(icon, HeaderPlaceholderGuard(icon, row, sbn, snapshot, plan, hostArtwork))
             ?.stop()
         headerPlaceholderGuards[icon]?.start()
     }
@@ -1793,6 +1800,13 @@ internal class NotificationPanelHooks(
          * A null plan keeps the old cold-start behaviour and resolves the theme icon lazily.
          */
         private val plan: NotificationIconResolver.PanelIconRenderPlan? = null,
+        /**
+         * The artwork the host had in the slot when the themed icon was written. Its cache repaint
+         * puts exactly this back, and it is usually neither the launcher icon nor a plain mask —
+         * ColorOS refills `mIcon` from `Notification#smallIcon` — so recognising it by content is
+         * what keeps the guard alive through that repaint. See [HostAvatarPresence.looksLikeSameArtwork].
+         */
+        private val hostArtwork: Drawable? = null,
     ) : ViewTreeObserver.OnPreDrawListener, View.OnAttachStateChangeListener {
 
         private var observer: ViewTreeObserver? = null
@@ -1839,10 +1853,46 @@ internal class NotificationPanelHooks(
             if (headerPlaceholderGuards[icon] === this) headerPlaceholderGuards.remove(icon)
         }
 
+        /**
+         * Swaps this guard for one bound to [latest] instead of dropping it.
+         *
+         * A configuration reload (theme switch, settings change) swaps the `RuntimeSnapshot`
+         * instance, so `isCurrent` turns false for every guard installed under the previous one
+         * while the rows keep living. Stopping there handed those rows back to the host for the
+         * rest of the session — only a SystemUI restart brought the theme icon back. Re-resolving
+         * under the new snapshot is the correct exit; a null plan there means the row should
+         * yield now, and then dropping the guard is right.
+         */
+        fun rearmUnder(latest: RuntimeSnapshot) {
+            stop()
+            val latestSbn = runCatching { row?.let { statusBarNotificationFromRow(it) } }.getOrNull()
+                ?: return
+            if (latestSbn.key != sbn.key) return
+            val latestPlan = runCatching {
+                latest.resolver.resolvePanelIconPlan(
+                    context = icon.context,
+                    sbn = latestSbn,
+                    originalSmallIcon = latestSbn.originalSmallIcon(diagnostics, latest.revision),
+                )
+            }.getOrNull() ?: return
+            val previous = icon.drawable
+            icon.applyRenderPlan(latestPlan, PanelIconTarget.Header)
+            headerPlaceholderGuards
+                .put(icon, HeaderPlaceholderGuard(icon, row, latestSbn, latest, latestPlan, previous))
+                ?.stop()
+            headerPlaceholderGuards[icon]?.start()
+        }
+
         override fun onPreDraw(): Boolean {
             if (stopped) return true
-            if (!icon.isAttachedToWindow || !configuration.isCurrent(snapshot)) {
-                stop()
+            // A detached view never draws; if this does fire while the row is between layouts just
+            // wait — [onViewAttachedToWindow] re-arms the listener anyway.
+            if (!icon.isAttachedToWindow) return true
+            // A reloaded configuration swaps the snapshot instance, so every guard from the
+            // previous one is stale. Dropping it left the row to the host for the rest of the
+            // session (only a restart brought the theme icon back), so re-arm instead.
+            if (!configuration.isCurrent(snapshot)) {
+                rearmUnder(configuration.snapshot)
                 return true
             }
             val key = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }.getOrNull()
@@ -1867,16 +1917,20 @@ internal class NotificationPanelHooks(
                 ?: return true
             val current = icon.drawable ?: return true
             if (current === themedNow) return true
-            // Anything else on screen is the host's own content — a contact photo, or the
-            // "photo + badge" composition it built around one. That wins; the guard is done.
-            if (!isHostAppIconPlaceholder(current)) {
-                stop()
-                return true
-            }
             val now = SystemClock.uptimeMillis()
+            // Rate-limit first: identifying the artwork samples two bitmaps, and a host that keeps
+            // repainting every frame must not turn that into per-frame work.
             if (writes >= MAX_GROUP_ICON_TAKEOVERS &&
                 now - lastWriteAt < TAKEOVER_QUIET_INTERVAL_MILLIS
             ) {
+                return true
+            }
+            // Anything else on screen is either the host's own placeholder or real content (a
+            // contact photo, or the "photo + badge" composition it built around one). Only the
+            // former may be covered; the latter wins and the guard is done.
+            if (!isHostPlaceholder(current)) {
+                reportYieldedSlot(current)
+                stop()
                 return true
             }
             writes++
@@ -1885,7 +1939,7 @@ internal class NotificationPanelHooks(
                 diagnostics.report(
                     level = DiagnosticLevel.Info,
                     event = DiagnosticEvent.HostAvatarReplace,
-                    message = "角标诊断：${sbn.packageName} 宿主的头像位里只有应用图标，改用主题图标",
+                    message = "角标诊断：${sbn.packageName} 宿主的头像位里是原样图标（应用图标/小图标），改用主题图标",
                     attributes = mapOf("package" to sbn.packageName, "key" to sbn.key),
                     occurrence = OccurrencePolicy.Once("header_placeholder_guard:${sbn.key}"),
                 )
@@ -1900,10 +1954,42 @@ internal class NotificationPanelHooks(
             return true
         }
 
+        /**
+         * Whether what the host (re)painted into the slot is its own placeholder rather than a
+         * picture worth keeping.
+         *
+         * The three appearance checks cover the usual artwork — the app's launcher icon, a blank
+         * sheet, the monochrome mask — but not the refill ColorOS actually does most often: `mIcon`
+         * gets `Notification#smallIcon` again, a tinted brand glyph that matches none of them.
+         * Comparing against [hostArtwork] catches that by content, so a plain single row cannot
+         * silently drop back to the raw icon and stay there (the guard used to stop on the first
+         * unknown drawable, i.e. on exactly that refill).
+         */
+        private fun isHostPlaceholder(drawable: Drawable): Boolean =
+            isHostAppIconPlaceholder(drawable) ||
+                HostAvatarPresence.looksLikeSameArtwork(drawable, hostArtwork) ||
+                HostAvatarPresence.looksLikeNotificationSmallIcon(icon.context, sbn, drawable)
+
         private fun isHostAppIconPlaceholder(drawable: Drawable): Boolean =
             HostAvatarPresence.looksLikeLauncherIcon(icon.context, sbn.packageName, drawable) ||
                 HostAvatarPresence.looksBlank(drawable) ||
                 HostAvatarPresence.looksLikeMonochromeMask(drawable)
+
+        /** Records what was left on screen when the guard gave the slot back, so a log explains it. */
+        private fun reportYieldedSlot(drawable: Drawable) {
+            diagnostics.report(
+                level = DiagnosticLevel.Debug,
+                event = DiagnosticEvent.HostAvatarYield,
+                message = "角标诊断：${sbn.packageName} 头像位里不是宿主的占位图，让给宿主",
+                attributes = mapOf(
+                    "package" to sbn.packageName,
+                    "key" to sbn.key,
+                    "art" to "${drawable.javaClass.simpleName} " +
+                        "${drawable.intrinsicWidth}x${drawable.intrinsicHeight}",
+                ),
+                occurrence = OccurrencePolicy.Once("header_guard_yield:${sbn.key}"),
+            )
+        }
 
         override fun onViewAttachedToWindow(view: View) {
             if (stopped) return
