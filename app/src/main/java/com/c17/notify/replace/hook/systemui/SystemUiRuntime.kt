@@ -178,6 +178,7 @@ internal class SystemUiRuntime(
                 FluidCloudHooks(
                     hooks = hooks,
                     diagnostics = diagnostics,
+                    configuration = configuration,
                     members = members,
                 ).install()
             }
