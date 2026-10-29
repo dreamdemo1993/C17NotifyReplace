@@ -73,6 +73,7 @@ internal class NotificationPanelHooks(
         installPackageIconResolverHooks()
         installPackageIconByNameHooks()
         installHiddenContentHooks()
+        installChildrenContainerHooks()
         members.headerOnContentUpdated?.let { method ->
             hooks.install(method, "systemui.panel.header.onContentUpdated") { chain ->
                 val result = chain.proceed()
@@ -194,6 +195,107 @@ internal class NotificationPanelHooks(
             }
             result
         }
+    }
+
+    /**
+     * Aggregated groups hand each child row to the container long before it is shown: the host
+     * inflates the row while the shade is closed, and opening the shade only lays the existing views
+     * out again — `onContentUpdated` never fires for them a second time. Those rows therefore kept
+     * the raw `smallIcon` until a SystemUI restart rebuilt the list, which is the "拼多多有几条是原生
+     * 图标、重启就又好了" report.
+     *
+     * `OplusNotificationChildrenContainer.onViewAdded` is the one callback that sees such a row at
+     * the moment it joins the group. Apply the icon there, then again on the following frames: the
+     * host paints its own small icon right after this returns, and the entry is often still unbound
+     * on the very first pass.
+     */
+    private fun installChildrenContainerHooks() {
+        val rowWrapper = members.expandableRowGetViewWrapper
+        if (rowWrapper == null) {
+            reportChildrenHookMissing(members.childrenContainerOnViewAdded, members.stackOnViewAdded)
+            return
+        }
+        val rowClass = members.expandableRowGetEntry.declaringClass
+        // Two entry points, same treatment: a child row joining its group container, and a row
+        // joining the shade's own scroll list. Whichever the host goes through, the row is seen
+        // before it is first shown, so the icon no longer depends on a bind that may never come.
+        val hooksByEntry = listOfNotNull(
+            members.childrenContainerOnViewAdded?.let { it to "systemui.panel.children.onViewAdded" },
+            members.stackOnViewAdded?.let { it to "systemui.panel.stack.onViewAdded" },
+        )
+        if (hooksByEntry.isEmpty()) {
+            reportChildrenHookMissing(null, null)
+            return
+        }
+        hooksByEntry.forEach { (method, tag) ->
+            hooks.install(method, tag) { chain ->
+                val result = chain.proceed()
+                (chain.args.firstOrNull() as? View)?.let { added ->
+                    if (rowClass.isInstance(added)) {
+                        scheduleRowIconPasses(added, rowWrapper, configuration.snapshot)
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    private fun scheduleRowIconPasses(row: View, rowWrapper: Method, snapshot: RuntimeSnapshot) {
+        CHILD_ROW_REAPPLY_DELAYS.forEach { delay ->
+            row.postDelayed(
+                {
+                    if (configuration.isCurrent(snapshot)) reapplyRowIcon(row, rowWrapper)
+                },
+                delay,
+            )
+        }
+    }
+
+    private fun reportChildrenHookMissing(onViewAdded: Method?, stackOnViewAdded: Method?) {
+        diagnostics.memberMissing(
+            scope = "systemui:panel:children_container",
+            message = "未找到行加入回调（容器=$onViewAdded, 列表=$stackOnViewAdded），" +
+                "分组内新到达的行只在 bind 时替换图标",
+        )
+    }
+
+    private fun reapplyRowIcon(row: View, rowWrapper: Method) {
+        if (!row.isAttachedToWindow) return
+        val wrapper = try {
+            rowWrapper.invoke(row)
+        } catch (exception: Exception) {
+            diagnostics.runtimeFailure(
+                scope = "panel:children_row_wrapper",
+                message = "分组子行取不到 Header wrapper，跳过图标补铺",
+                cause = exception,
+                revision = configuration.snapshot.revision,
+            )
+            return
+        } ?: return
+        // The collapsed summary has its own hooks (initIcon / flushIcon) which already hold a
+        // long-lived guard for it; running this pass on top would stack a second one per regroup.
+        if (wrapper.iconTarget != PanelIconTarget.Header) return
+        applyPanelIcon(
+            wrapper = wrapper,
+            rowCandidate = row,
+            target = PanelIconTarget.Header,
+            skipIfAlreadyApplied = true,
+        )
+    }
+
+    /**
+     * One record per reason per minute: opening the shade walks dozens of rows, and the only thing
+     * this line has to answer is whether a row was ever reached at all — that is the difference
+     * between "the hooks never fired for this row type" and "we wrote and the host overwrote us".
+     */
+    private fun reportRowSkipped(reason: String, detail: String, snapshot: RuntimeSnapshot) {
+        diagnostics.report(
+            level = DiagnosticLevel.Debug,
+            event = DiagnosticEvent.PanelRowSkipped,
+            message = "面板行未替换主题图标：$reason",
+            attributes = mapOf("detail" to detail, "revision" to snapshot.revision),
+            occurrence = OccurrencePolicy.RateLimited("panel:row_skipped:$reason", 60_000L),
+        )
     }
 
     /**
@@ -1322,6 +1424,7 @@ internal class NotificationPanelHooks(
         expectedSnapshot: RuntimeSnapshot? = null,
         allowDeferredLookup: Boolean = true,
         verifyAfterWrite: Boolean = true,
+        skipIfAlreadyApplied: Boolean = false,
     ) {
         val snapshot = expectedSnapshot ?: configuration.snapshot
         if (expectedSnapshot != null && !configuration.isCurrent(snapshot)) return
@@ -1329,7 +1432,10 @@ internal class NotificationPanelHooks(
         try {
             val row = rowCandidate
                 ?: runCatching { members.notificationViewWrapperRow.get(wrapper) }.getOrNull()
-                ?: return
+                ?: run {
+                    reportRowSkipped("no_row", wrapper.javaClass.simpleName, snapshot)
+                    return
+                }
             val rowView = row as? View
             val icon = when (target) {
                 PanelIconTarget.Header -> members.headerGetIcon?.invoke(wrapper) as? ImageView
@@ -1338,7 +1444,10 @@ internal class NotificationPanelHooks(
                     (members.headerGetIcon?.invoke(wrapper) as? ImageView)
                         ?: rowView?.findOplusGroupSummaryIcon()
             } ?: run {
-                if (target == PanelIconTarget.OplusGroupSummary && allowDeferredLookup && rowView != null) {
+                // Rows built by the host while the shade was closed can still be mid-inflate here:
+                // there is no header icon view yet on the first pass, and nothing else would ever
+                // come back for them. Retry once on the next loop for both targets.
+                if (allowDeferredLookup && rowView != null) {
                     rowView.post {
                         if (configuration.isCurrent(snapshot)) {
                             applyPanelIcon(
@@ -1350,11 +1459,27 @@ internal class NotificationPanelHooks(
                             )
                         }
                     }
+                } else {
+                    reportRowSkipped("no_icon", "${wrapper.javaClass.simpleName}/${row.javaClass.simpleName}", snapshot)
                 }
                 return
             }
-            if (target == PanelIconTarget.Header) headerIconClaims.release(icon)
-            val sbn = statusBarNotificationFromRow(row) ?: return
+            val sbn = statusBarNotificationFromRow(row) ?: run {
+                reportRowSkipped("no_sbn", row.javaClass.simpleName, snapshot)
+                return
+            }
+            if (target == PanelIconTarget.Header) {
+                // A row that already shows the icon this module put there needs no second write: the
+                // add-time passes fire on every regroup, and re-writing for the same key only costs a
+                // redraw and a log line.
+                val shown = icon.drawable
+                if (skipIfAlreadyApplied && shown != null &&
+                    headerIconClaims.isCurrentClaim(icon, sbn.key, shown)
+                ) {
+                    return
+                }
+                headerIconClaims.release(icon)
+            }
             // "Hide notification content" shows the public (redacted) layout instead of the avatar
             // composition; handle the icon there and stop before the avatar yield runs.
             if (target == PanelIconTarget.Header && applyHiddenContentIcon(row)) return
@@ -2458,6 +2583,13 @@ internal class NotificationPanelHooks(
          * window `CachingIconView` and the avatar coroutine were observed to land in.
          */
         const val MAX_ICON_VERIFY_PASSES = 4
+
+        /**
+         * When a child row joins an aggregated group. The first pass runs on the next loop so the
+         * host's own inflation has finished, the later ones cover the host painting its small icon
+         * and the entry being bound late. Delays are absolute, not cumulative.
+         */
+        val CHILD_ROW_REAPPLY_DELAYS = longArrayOf(0L, 320L, 1000L)
 
         /**
          * How many repair passes the draw-time guard logs before it goes quiet. It never stops

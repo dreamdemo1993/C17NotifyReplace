@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.Icon
 import android.service.notification.StatusBarNotification
+import android.view.View
 import android.widget.FrameLayout
 import android.widget.ImageView
 import com.c17.notify.replace.diagnostics.Diagnostics
@@ -68,6 +69,8 @@ internal data class PanelMembers(
     val notificationEntryGetSbn: Method,
     val notificationViewWrapperRow: Field,
     val expandableRowGetEntry: Method,
+    /** `ExpandableNotificationRow.getNotificationViewWrapper()` — row back to its header wrapper. */
+    val expandableRowGetViewWrapper: Method?,
     val headerOnContentUpdated: Method?,
     val headerResolveHeaderViews: Method?,
     val headerSetIsChildInGroup: Method?,
@@ -80,6 +83,16 @@ internal data class PanelMembers(
     val oplusGroupFlushIcon: Method?,
     val oplusGroupAttachBadge: Method?,
     val childrenContainerContainingNotification: Method?,
+    /**
+     * `OplusNotificationChildrenContainer.onViewAdded(View)` — fires for every child row that joins
+     * an aggregated group, including the rows the host inflates while the shade is closed.
+     */
+    val childrenContainerOnViewAdded: Method?,
+    /**
+     * `NotificationStackScrollLayout.onViewAdded(View)` — the shade's own list. Every row passes
+     * through it, including the plain rows the host inflates while the shade is closed.
+     */
+    val stackOnViewAdded: Method?,
     val groupIconInitIconViewColor: Method?,
     val groupIconInitPillBgAndNumberColor: Method?,
     val groupIconInitEntryIconDrawable: Method?,
@@ -317,6 +330,11 @@ internal object SystemUiMembers {
             "getEntry",
             notificationEntry,
         )
+        val expandableRowGetViewWrapper = Reflection.findMethodReturning(
+            expandableRow,
+            "getNotificationViewWrapper",
+            notificationViewWrapper,
+        )
         if (
             notificationEntryGetSbn == null ||
             notificationViewWrapperRow == null ||
@@ -416,6 +434,17 @@ internal object SystemUiMembers {
         val childrenContainerContainingNotification = childrenContainer?.let {
             Reflection.findMethodReturning(it, "getContainingNotification", expandableRow)
                 ?: Reflection.findAnyMethod(it, "getContainingNotification", expandableRow)
+        }
+        // Only the Oplus override is interesting: hooking the inherited ViewGroup.onViewAdded would
+        // fire for every view added to every container in SystemUI. Keeping the declaring-class check
+        // makes that failure mode explicit instead of installing a process-wide hook by accident.
+        val childrenContainerOnViewAdded = classes.optional(OPLUS_CHILDREN_CONTAINER)?.let { oplus ->
+            Reflection.findMethodReturning(oplus, "onViewAdded", Void.TYPE, View::class.java)
+                ?.takeIf { it.declaringClass == oplus }
+        }
+        val stackOnViewAdded = classes.optional(NOTIFICATION_STACK_SCROLL_LAYOUT)?.let { stack ->
+            Reflection.findMethodReturning(stack, "onViewAdded", Void.TYPE, View::class.java)
+                ?.takeIf { it.declaringClass == stack }
         }
         if (
             oplusGroupWrapper == null ||
@@ -608,6 +637,9 @@ internal object SystemUiMembers {
             oplusGroupFlushIcon = oplusGroupFlushIcon,
             oplusGroupAttachBadge = oplusGroupAttachBadge,
             childrenContainerContainingNotification = childrenContainerContainingNotification,
+            childrenContainerOnViewAdded = childrenContainerOnViewAdded,
+            stackOnViewAdded = stackOnViewAdded,
+            expandableRowGetViewWrapper = expandableRowGetViewWrapper,
             groupIconInitIconViewColor = groupIconInitIconViewColor,
             groupIconInitPillBgAndNumberColor = groupIconInitPillBgAndNumberColor,
             groupIconInitEntryIconDrawable = groupIconInitEntryIconDrawable,
@@ -1382,6 +1414,13 @@ internal object SystemUiMembers {
         "com.oplus.systemui.notification.row.oplusgroup.OplusNotificationGroupExtImpl"
     private const val NOTIFICATION_CHILDREN_CONTAINER =
         "com.android.systemui.statusbar.notification.stack.NotificationChildrenContainer"
+
+    // ColorOS 17 overrides onViewAdded here, which is the only callback that sees a child row of an
+    // aggregated group at the moment it joins the container.
+    private const val OPLUS_CHILDREN_CONTAINER =
+        "com.oplus.systemui.notification.row.oplusgroup.OplusNotificationChildrenContainer"
+    private const val NOTIFICATION_STACK_SCROLL_LAYOUT =
+        "com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayout"
     private const val GROUP_ICON_MANAGER =
         "com.oplus.systemui.notification.row.oplusgroup.GroupIconManager"
     private const val GROUP_ICON_INFO =

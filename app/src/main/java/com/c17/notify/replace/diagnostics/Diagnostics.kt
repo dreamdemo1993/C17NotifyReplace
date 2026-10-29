@@ -23,6 +23,7 @@ internal enum class DiagnosticEvent(val id: String) {
     ThemeIconBlank("theme.icon_blank"),
     ThemeChanged("theme.changed"),
     IconReapplied("icon.reapplied"),
+    PanelRowSkipped("icon.row_skipped"),
     HostAvatarYield("icon.host_avatar_yield"),
     HostAvatarReplace("icon.host_avatar_replace"),
     HostAvatarPrefill("icon.host_avatar_prefill"),
