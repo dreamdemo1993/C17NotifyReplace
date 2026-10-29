@@ -1,7 +1,6 @@
 package com.c17.notify.replace.hook.games
 
 import android.graphics.drawable.Drawable
-import android.widget.ImageView
 import com.c17.notify.replace.hook.reflect.Reflection
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -20,8 +19,9 @@ internal class HookTarget(val owner: Class<*>, val method: Method) {
  * - `ExternalApplicationManager` → `business.secondarypanel.manager.a`;
  * - `ExternalApplicationManager#u(String)` → that class' `f(String)`;
  * - `GameAppCellView#c(model, position)` → `V`;
- * - `MessageNotificationBoxManager` → renamed as well (the old name survives only inside the
- *   anonymous inner classes R8 left behind).
+ * - `MessageNotificationBoxManager#Y(ImageView, MessageData)` → gone entirely; the message box now
+ *   binds through the commonui multitype adapter and builds its mark from a bundled resource, so
+ *   the mark is replaced from the row's views instead — see `GameAssistantRuntime`.
  *
  * A name that only lives until the next build is not an anchor — the signature is. Each lookup
  * below walks the class names R8 hands out (`a`, `b`, … in the original package, the legacy name
@@ -32,11 +32,7 @@ internal object GameAssistantMembers {
     /** Package that holds `ExternalApplicationManager` and friends. */
     const val EDGE_PANEL_PACKAGE = "business.secondarypanel.manager"
 
-    /** Package that holds `MessageNotificationBoxManager` and `MessageData`. */
-    const val MESSAGE_BOX_PACKAGE = "business.mainpanel.welfare"
-
     private const val LEGACY_EDGE_MANAGER = "ExternalApplicationManager"
-    private const val LEGACY_MESSAGE_BOX = "MessageNotificationBoxManager"
 
     /** The game dock's `Drawable` factory: `u(String)` before 10.43.7, `f(String)` after. */
     fun edgePanelIconLoader(classLoader: ClassLoader): HookTarget? =
@@ -44,14 +40,6 @@ internal object GameAssistantMembers {
             method.parameterCount == 1 &&
                 method.parameterTypes[0] == String::class.java &&
                 Drawable::class.java.isAssignableFrom(method.returnType)
-        }
-
-    /** The message box's app mark: `Y(ImageView, MessageData)`. */
-    fun messageBadgeBinder(classLoader: ClassLoader, messageData: Class<*>): HookTarget? =
-        firstInPackage(classLoader, MESSAGE_BOX_PACKAGE, LEGACY_MESSAGE_BOX) { method ->
-            method.parameterCount == 2 &&
-                method.parameterTypes[0] == ImageView::class.java &&
-                method.parameterTypes[1].isAssignableFrom(messageData)
         }
 
     /**

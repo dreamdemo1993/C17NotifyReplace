@@ -43,6 +43,10 @@ internal class GameAssistantRuntime(
     private val processName: String,
 ) {
 
+    /** One row-binder hook per binder class: the list re-registers on every fragment rebuild. */
+    private val messageBadgeBinds: MutableSet<java.lang.reflect.Method> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<java.lang.reflect.Method>()
+
     fun install(classLoader: ClassLoader) {
         // The theme icon comes from a framework-only API that Android lists as hidden; the module
         // already does the same exemption for its SystemUI runtime.
@@ -215,12 +219,13 @@ internal class GameAssistantRuntime(
     }
 
     /**
-     * App mark next to the contact avatar in the message box: the host sets a bundled icon resource
-     * looked up from the package name.
+     * App mark next to the contact avatar in the message box.
      *
-     * 10.43.7 renamed `MessageNotificationBoxManager` and the `Y(ImageView, MessageData)` entry
-     * point is gone from that shape; the lookup keeps trying, and the log says which one it found
-     * or that it found none — the mark then falls back to the host's own artwork.
+     * 10.43.7 removed `MessageNotificationBoxManager#Y(ImageView, MessageData)`: the box now binds
+     * through the commonui multitype list, and the mark is a *bundled* drawable resource chosen by
+     * package name (`business.mainpanel.welfare.a#h(String)`) and loaded with Glide. Nothing on that
+     * path carries the row's `ImageView`, so the row binder is hooked instead and the mark is
+     * overwritten after the bind.
      */
     private fun installMessageBadge(classLoader: ClassLoader, replacer: GameIconReplacer) {
         val messageData = Reflection.loadClassOrNull(MESSAGE_DATA, classLoader) { cause ->
@@ -230,29 +235,201 @@ internal class GameAssistantRuntime(
                 cause = cause,
             )
         } ?: return
-        val target = GameAssistantMembers.messageBadgeBinder(classLoader, messageData) ?: run {
+        // The list is registered through the vendor's multitype adapter: every data class gets an
+        // entry `(dataClass, binder, listener)`. Hooking that entry is how the message box's binder
+        // is reached without knowing its (obfuscated) class name.
+        val multitype = Reflection.loadClassOrNull(MULTITYPE_BUILDER, classLoader) { cause ->
             diagnostics.memberMissing(
-                scope = "games:message_badge_method",
-                message = "未找到消息盒子的角标方法 (ImageView, MessageData)，跳过消息角标替换",
+                scope = "games:message_badge_multitype",
+                message = "未找到游戏助手列表注册器，跳过消息角标替换",
+                cause = cause,
+            )
+        } ?: return
+        val entryClass = Reflection
+            .findMethodReturning(multitype, MULTITYPE_ENTRY_GETTER, null, Int::class.javaPrimitiveType)
+            ?.returnType ?: run {
+                diagnostics.memberMissing(
+                    scope = "games:message_badge_entry",
+                    message = "未找到游戏助手列表条目类型，跳过消息角标替换",
+                )
+                return
+            }
+        val entryConstructor = entryClass.declaredConstructors.firstOrNull { candidate ->
+            candidate.parameterCount == 3 &&
+                candidate.parameterTypes[0] == Class::class.java &&
+                !candidate.parameterTypes[1].name.startsWith(ANDROID_PACKAGE_PREFIX) &&
+                candidate.parameterTypes[2] != Class::class.java
+        } ?: run {
+            diagnostics.memberMissing(
+                scope = "games:message_badge_entry_ctor",
+                message = "未找到游戏助手列表条目构造器，跳过消息角标替换",
             )
             return
         }
-        reportResolved(SITE_MESSAGE_BADGE, target.label)
-        hooks.install(target.method, "games.message_box.app_mark") { chain ->
-            val view = chain.args.getOrNull(0) as? ImageView
-            val packageName = notificationPackage(chain.args.getOrNull(1))
-            val themed = view?.let { replacer.drawableFor(SITE_MESSAGE_BADGE, packageName) }
-            // The host also hides the mark for group conversations, so its own call must still run.
-            // It loads the bundled icon through Glide, hence the pending request is cancelled before
-            // the theme icon is written — and kept by the takeover, because that request can still
-            // deliver after the clear.
+        hooks.install(entryConstructor, "games.message_box.register") { chain ->
+            val dataType = chain.args.getOrNull(0) as? Class<*>
+            val binder = chain.args.getOrNull(1)
             val result = chain.proceed()
-            if (view != null && themed != null) {
-                clearGlideRequest(view, classLoader)
-                GameIconTakeovers.take(view, themed)
+            if (dataType == messageData && binder != null) {
+                // Installed off the constructor callback: hooking a method from inside another
+                // hook's dispatch is legal but needlessly fragile.
+                Handler(Looper.getMainLooper()).post {
+                    runCatching { hookMessageRowBinder(binder, messageData, replacer, classLoader) }
+                }
             }
             result
         }
+    }
+
+    /**
+     * Hooks the binder that draws one message row.
+     *
+     * The binder is shared by several row types (`ci` in 10.43.7), so the callback first checks the
+     * data class. Its bind method is `(position: Int, holder: ViewHolder, data: Any?)`. The holder
+     * type is matched by shape, not by name: this APK is R8-processed down to `androidx` too, so
+     * `RecyclerView$ViewHolder` exists only as `androidx.recyclerview.widget.d0` here — the module's
+     * own copy of that class would never be assignable to it.
+     */
+    private fun hookMessageRowBinder(
+        binder: Any,
+        messageData: Class<*>,
+        replacer: GameIconReplacer,
+        classLoader: ClassLoader,
+    ) {
+        val bind = messageBindMethod(binder.javaClass) ?: run {
+            diagnostics.memberMissing(
+                scope = "games:message_badge_bind",
+                message = "未找到消息行的绑定方法 (Int, ViewHolder, Any)，跳过消息角标替换",
+            )
+            return
+        }
+        synchronized(messageBadgeBinds) {
+            if (!messageBadgeBinds.add(bind)) return
+        }
+        reportResolved(SITE_MESSAGE_BADGE, binder.javaClass.name + "#" + bind.name)
+        hooks.install(bind, "games.message_box.row") { chain ->
+            val holder = chain.args.getOrNull(1)
+            val data = chain.args.getOrNull(2)
+            val result = chain.proceed()
+            if (data != null && messageData.isInstance(data)) {
+                runCatching { applyMessageBadge(holder, data, replacer, classLoader) }
+            }
+            result
+        }
+    }
+
+    /**
+     * The host builds its mark from a *bundled* drawable resource keyed by package name
+     * (`business.mainpanel.welfare.a#h(String)`), so the picture never goes through
+     * `PackageManager` and the launcher-icon hook cannot see it. The row's views are the only place
+     * the theme icon can be written, and the mark is the small round view next to the avatar.
+     */
+    private fun applyMessageBadge(
+        holder: Any?,
+        data: Any,
+        replacer: GameIconReplacer,
+        classLoader: ClassLoader,
+    ) {
+        val root = itemViewOf(holder) ?: return
+        val packageName = notificationPackage(data) ?: return
+        val themed = replacer.drawableFor(SITE_MESSAGE_BADGE, packageName) ?: return
+        val badge = findMessageBadge(root) ?: run {
+            reportBadgeMiss(root, packageName)
+            return
+        }
+        clearGlideRequest(badge, classLoader)
+        GameIconTakeovers.take(badge, themed, MESSAGE_BADGE_WINDOW_MILLIS)
+    }
+
+    /** `RecyclerView.ViewHolder#itemView`, read reflectively for the reason above. */
+    private fun itemViewOf(holder: Any?): View? {
+        if (holder == null) return null
+        var current: Class<*>? = holder.javaClass
+        while (current != null) {
+            val field = runCatching { current.getDeclaredField(ITEM_VIEW_FIELD) }.getOrNull()
+            if (field != null && View::class.java.isAssignableFrom(field.type)) {
+                return runCatching {
+                    field.isAccessible = true
+                    field.get(holder) as? View
+                }.getOrNull()
+            }
+            current = current.superclass
+        }
+        return null
+    }
+
+    /**
+     * `(position: Int, holder: <any class with an itemView>, data: Object): void` — the shape every
+     * row binder of this list shares.
+     */
+    private fun messageBindMethod(owner: Class<*>): java.lang.reflect.Method? {
+        var current: Class<*>? = owner
+        while (current != null && current != Any::class.java) {
+            val methods = current.declaredMethods
+            for (method in methods) {
+                if (method.parameterCount != 3) continue
+                if (method.parameterTypes[0] != Int::class.javaPrimitiveType) continue
+                if (method.parameterTypes[2] != Any::class.java) continue
+                if (method.returnType != Void.TYPE) continue
+                if (java.lang.reflect.Modifier.isStatic(method.modifiers)) continue
+                if (!hasItemView(method.parameterTypes[1])) continue
+                return method
+            }
+            current = current.superclass
+        }
+        return null
+    }
+
+    private fun hasItemView(candidate: Class<*>): Boolean {
+        var current: Class<*>? = candidate
+        while (current != null) {
+            if (runCatching { current.getDeclaredField(ITEM_VIEW_FIELD) }.isSuccess) return true
+            current = current.superclass
+        }
+        return false
+    }
+
+    /**
+     * The mark is the small round image that overlaps the contact avatar. Both are
+     * `COUIRoundImageView`, so it is picked by size: a visible round view no wider than 28dp (the
+     * avatar next to it is 40dp and up). When the row is a group chat the host hides the mark,
+     * nothing qualifies, and the avatar is left alone.
+     */
+    private fun findMessageBadge(root: View): ImageView? {
+        val candidates = ArrayList<ImageView>(4)
+        collectMarkViews(root, candidates, 0)
+        if (candidates.isEmpty()) return null
+        val round = candidates.filter { view -> view.javaClass.name.contains(ROUND_IMAGE_VIEW) }
+        val pool = round.ifEmpty { candidates }
+        return pool.maxByOrNull { maxOf(it.width, it.height) }
+    }
+
+    private fun collectMarkViews(view: View, out: MutableList<ImageView>, depth: Int) {
+        if (depth > MAX_MARK_DEPTH) return
+        if (view is ImageView) {
+            val density = view.resources.displayMetrics.density
+            val longest = maxOf(view.width, view.height)
+            if (view.visibility == View.VISIBLE &&
+                longest in (MARK_MIN_DP * density).toInt()..(MARK_MAX_DP * density).toInt()
+            ) {
+                out.add(view)
+            }
+        }
+        if (view is android.view.ViewGroup) {
+            for (index in 0 until view.childCount) {
+                collectMarkViews(view.getChildAt(index), out, depth + 1)
+            }
+        }
+    }
+
+    private fun reportBadgeMiss(root: View, packageName: String) {
+        diagnostics.report(
+            level = DiagnosticLevel.Debug,
+            event = DiagnosticEvent.PackageIconResolved,
+            message = "消息盒子角标：行内没找到小尺寸圆形图标，本次保留宿主图标",
+            attributes = mapOf("package" to packageName, "stage" to "message_badge_view"),
+            occurrence = OccurrencePolicy.Once("games:badge_miss:" + root.javaClass.name),
+        )
     }
 
     /**
@@ -332,6 +509,24 @@ internal class GameAssistantRuntime(
         const val BARRAGE_MANAGER = "com.oplus.feature.barragenotification.BarrageManager"
         const val MESSAGE_DATA = "business.mainpanel.welfare.MessageData"
         const val THEME_ICON_FRAMEWORK_CLASS = "Landroid/app/UxIconPackageManagerExt;"
+
+        /** Vendor multitype list: holds `(dataClass, binder, listener)` entries for every row type. */
+        const val MULTITYPE_BUILDER = "com.oplus.commonui.multitype.b"
+        const val MULTITYPE_ENTRY_GETTER = "b"
+
+        const val ANDROID_PACKAGE_PREFIX = "android."
+        const val ROUND_IMAGE_VIEW = "COUIRoundImageView"
+
+        /** RecyclerView's holder field; the class itself is obfuscated in this APK. */
+        const val ITEM_VIEW_FIELD = "itemView"
+
+        /** The message-box mark is ~18dp; the avatar next to it is 40dp and up. */
+        const val MARK_MIN_DP = 6
+        const val MARK_MAX_DP = 28
+        const val MAX_MARK_DEPTH = 6
+
+        /** Glide delivers the host's bundled mark a few frames later, so the guard outlives the bind. */
+        const val MESSAGE_BADGE_WINDOW_MILLIS = 10_000L
 
         /** Prefix of the dock cell's state object; the concrete class name survived 10.43.7. */
         const val GAME_STATE_PACKAGE = "business.gamedock."
