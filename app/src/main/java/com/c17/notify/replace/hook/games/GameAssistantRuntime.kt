@@ -323,7 +323,8 @@ internal class GameAssistantRuntime(
      * The host builds its mark from a *bundled* drawable resource keyed by package name
      * (`business.mainpanel.welfare.a#h(String)`), so the picture never goes through
      * `PackageManager` and the launcher-icon hook cannot see it. The row's views are the only place
-     * the theme icon can be written, and the mark is the small round view next to the avatar.
+     * the theme icon can be written, and the mark is the 16dp view in the avatar's top-right corner
+     * — **not** the 32dp avatar itself.
      */
     private fun applyMessageBadge(
         holder: Any?,
@@ -412,21 +413,27 @@ internal class GameAssistantRuntime(
     }
 
     /**
-     * The row stacks two `COUIRoundImageView`s: a 32dp app icon filled from the bundled
-     * `welfare.a#h(package)` resource — the plain artwork this module replaces — and a 16dp view
-     * over its top-right corner that carries the notification's `largeIcon` for group chats.
+     * Row structure (`business.mainpanel.welfare.…MessageBoxMsgVH`): a 32dp `COUIRoundImageView`
+     * with id `iv_avatar`, filled from the notification's `largeIcon`, and a 16dp
+     * `COUIRoundImageView` pinned to its top-right corner, filled from the bundled
+     * `welfare.a#h(package)` resource. The 16dp corner view is the app mark to replace; the 32dp
+     * one is a person's or a group's picture and must be left alone.
      *
-     * So the icon is the *larger* one, and the 16dp corner view is deliberately out of the size
-     * window: replacing it would paint the app icon over a contact's picture. Group rows hide the
-     * 32dp icon altogether, leaving nothing to do.
+     * The mark is therefore chosen as "a round view inside the size window that is *not* the
+     * avatar", and it must also be clearly smaller than the avatar next to it — a full-size round
+     * picture is never repainted.
      */
     private fun findMessageBadge(root: View): ImageView? {
         val marks = ArrayList<MarkCandidate>(8)
         collectMarkViews(root, marks, 0)
-        val measured = marks.filter { it.round && it.visible && it.widthDp > 0 && it.heightDp > 0 }
-        if (measured.isEmpty()) return null
-        val icon = measured.maxByOrNull { maxOf(it.widthDp, it.heightDp) } ?: return null
-        return icon.view.takeIf { icon.markSized }
+        val round = marks.filter { it.round && it.visible && it.widthDp > 0 && it.heightDp > 0 }
+        if (round.isEmpty()) return null
+        val avatar = round.filter { it.isAvatar }.maxByOrNull { it.longestDp }
+        val mark = round
+            .filter { !it.isAvatar && it.markSized }
+            .minByOrNull { it.longestDp } ?: return null
+        if (avatar != null && mark.longestDp * BADGE_SCALE_RATIO > avatar.longestDp) return null
+        return mark.view
     }
 
     private fun collectMarkViews(view: View, out: MutableList<MarkCandidate>, depth: Int) {
@@ -593,6 +600,9 @@ internal class GameAssistantRuntime(
         const val MAX_MARK_DEPTH = 6
         const val MAX_REPORTED_MARKS = 6
 
+        /** A 16dp mark over a 32dp avatar: anything closer in size is a full-size picture. */
+        const val BADGE_SCALE_RATIO = 2
+
         /** Glide delivers the host's bundled mark a few frames later, so the guard outlives the bind. */
         const val MESSAGE_BADGE_WINDOW_MILLIS = 10_000L
 
@@ -629,10 +639,18 @@ internal class MarkCandidate private constructor(
     /** The mark is a `COUIRoundImageView`; the shield icon and dividers are plain views. */
     val round: Boolean = view.javaClass.name.contains(ROUND_IMAGE_VIEW)
 
-    /** The row's app icon is 32dp; the contact picture over its corner is 16dp. */
+    /**
+     * The row's 32dp picture is the contact's/group's avatar (id `iv_avatar`). Its size alone is
+     * not proof — the resource name is stable in this APK, so it is checked as well.
+     */
+    val isAvatar: Boolean = idName.contains(AVATAR, ignoreCase = true)
+
+    val longestDp: Int get() = maxOf(widthDp, heightDp)
+
+    /** The corner mark is 16dp; the avatar it decorates is 32dp and up. */
     val markSized: Boolean
         get() {
-            val longest = maxOf(widthDp, heightDp)
+            val longest = longestDp
             val shortest = minOf(widthDp, heightDp)
             return longest in MARK_MIN_DP..MARK_MAX_DP &&
                 longest - shortest <= MARK_SQUARE_TOLERANCE_DP
@@ -662,10 +680,11 @@ internal class MarkCandidate private constructor(
         }
 
         private const val ROUND_IMAGE_VIEW = "COUIRoundImageView"
+        private const val AVATAR = "avatar"
 
-        /** 16dp is the corner picture (out of range); 32dp is the app icon. */
-        private const val MARK_MIN_DP = 24
-        private const val MARK_MAX_DP = 48
+        /** 16dp is the corner mark; the 32dp avatar next to it stays out of range. */
+        private const val MARK_MIN_DP = 6
+        private const val MARK_MAX_DP = 28
         private const val MARK_SQUARE_TOLERANCE_DP = 8
         private const val MAX_ID_NAME = 18
     }
