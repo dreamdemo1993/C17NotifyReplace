@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.Icon
 import android.os.Handler
 import android.os.Looper
@@ -333,12 +334,33 @@ internal class GameAssistantRuntime(
         val root = itemViewOf(holder) ?: return
         val packageName = notificationPackage(data) ?: return
         val themed = replacer.drawableFor(SITE_MESSAGE_BADGE, packageName) ?: return
-        val badge = findMessageBadge(root) ?: run {
+        // A row is bound while it is still unmeasured: every child reports 0×0 until the adapter's
+        // layout pass runs, and the mark is picked by size. Hence the retries.
+        retryMessageBadge(root, packageName, themed, classLoader, 0)
+    }
+
+    private fun retryMessageBadge(
+        root: View,
+        packageName: String,
+        themed: Drawable,
+        classLoader: ClassLoader,
+        attempt: Int,
+    ) {
+        val badge = findMessageBadge(root)
+        if (badge != null) {
+            clearGlideRequest(badge, classLoader)
+            GameIconTakeovers.take(badge, themed, MESSAGE_BADGE_WINDOW_MILLIS)
+            reportBadgeApplied(packageName, badge)
+            return
+        }
+        if (attempt >= BADGE_RETRY_DELAYS.size || (attempt > 0 && !root.isAttachedToWindow)) {
             reportBadgeMiss(root, packageName)
             return
         }
-        clearGlideRequest(badge, classLoader)
-        GameIconTakeovers.take(badge, themed, MESSAGE_BADGE_WINDOW_MILLIS)
+        root.postDelayed(
+            { runCatching { retryMessageBadge(root, packageName, themed, classLoader, attempt + 1) } },
+            BADGE_RETRY_DELAYS[attempt],
+        )
     }
 
     /** `RecyclerView.ViewHolder#itemView`, read reflectively for the reason above. */
@@ -390,30 +412,27 @@ internal class GameAssistantRuntime(
     }
 
     /**
-     * The mark is the small round image that overlaps the contact avatar. Both are
-     * `COUIRoundImageView`, so it is picked by size: a visible round view no wider than 28dp (the
-     * avatar next to it is 40dp and up). When the row is a group chat the host hides the mark,
-     * nothing qualifies, and the avatar is left alone.
+     * The row stacks two `COUIRoundImageView`s: a 32dp app icon filled from the bundled
+     * `welfare.a#h(package)` resource — the plain artwork this module replaces — and a 16dp view
+     * over its top-right corner that carries the notification's `largeIcon` for group chats.
+     *
+     * So the icon is the *larger* one, and the 16dp corner view is deliberately out of the size
+     * window: replacing it would paint the app icon over a contact's picture. Group rows hide the
+     * 32dp icon altogether, leaving nothing to do.
      */
     private fun findMessageBadge(root: View): ImageView? {
-        val candidates = ArrayList<ImageView>(4)
-        collectMarkViews(root, candidates, 0)
-        if (candidates.isEmpty()) return null
-        val round = candidates.filter { view -> view.javaClass.name.contains(ROUND_IMAGE_VIEW) }
-        val pool = round.ifEmpty { candidates }
-        return pool.maxByOrNull { maxOf(it.width, it.height) }
+        val marks = ArrayList<MarkCandidate>(8)
+        collectMarkViews(root, marks, 0)
+        val measured = marks.filter { it.round && it.visible && it.widthDp > 0 && it.heightDp > 0 }
+        if (measured.isEmpty()) return null
+        val icon = measured.maxByOrNull { maxOf(it.widthDp, it.heightDp) } ?: return null
+        return icon.view.takeIf { icon.markSized }
     }
 
-    private fun collectMarkViews(view: View, out: MutableList<ImageView>, depth: Int) {
+    private fun collectMarkViews(view: View, out: MutableList<MarkCandidate>, depth: Int) {
         if (depth > MAX_MARK_DEPTH) return
         if (view is ImageView) {
-            val density = view.resources.displayMetrics.density
-            val longest = maxOf(view.width, view.height)
-            if (view.visibility == View.VISIBLE &&
-                longest in (MARK_MIN_DP * density).toInt()..(MARK_MAX_DP * density).toInt()
-            ) {
-                out.add(view)
-            }
+            out.add(MarkCandidate.of(view))
         }
         if (view is android.view.ViewGroup) {
             for (index in 0 until view.childCount) {
@@ -422,14 +441,43 @@ internal class GameAssistantRuntime(
         }
     }
 
+    private fun reportBadgeApplied(packageName: String, badge: ImageView) {
+        val mark = MarkCandidate.of(badge)
+        diagnostics.report(
+            level = DiagnosticLevel.Info,
+            event = DiagnosticEvent.GameAssistantIconReplaced,
+            message = "消息盒子角标已替换为主题图标",
+            attributes = mapOf(
+                "package" to packageName,
+                "site" to SITE_MESSAGE_BADGE,
+                "stage" to "message_badge_view",
+                "target" to mark.describe(),
+            ),
+            occurrence = OccurrencePolicy.Once("games:badge_applied:" + badge.id),
+        )
+    }
+
     private fun reportBadgeMiss(root: View, packageName: String) {
         diagnostics.report(
             level = DiagnosticLevel.Debug,
             event = DiagnosticEvent.PackageIconResolved,
-            message = "消息盒子角标：行内没找到小尺寸圆形图标，本次保留宿主图标",
-            attributes = mapOf("package" to packageName, "stage" to "message_badge_view"),
-            occurrence = OccurrencePolicy.Once("games:badge_miss:" + root.javaClass.name),
+            message = "消息盒子角标：行内没有可识别的小图，本次保留宿主图标",
+            attributes = mapOf(
+                "package" to packageName,
+                "stage" to "message_badge_view",
+                "row" to root.javaClass.simpleName + "/" + root.childCount,
+                "views" to describeMarks(root),
+            ),
+            occurrence = OccurrencePolicy.RateLimited("games:badge_miss", 30_000L),
         )
+    }
+
+    /** Compact inventory of the row's images, so a future miss is diagnosable from one log line. */
+    private fun describeMarks(root: View): String {
+        val marks = ArrayList<MarkCandidate>(8)
+        collectMarkViews(root, marks, 0)
+        if (marks.isEmpty()) return "none"
+        return marks.take(MAX_REPORTED_MARKS).joinToString("|") { it.describe() }
     }
 
     /**
@@ -447,14 +495,31 @@ internal class GameAssistantRuntime(
     }
 
     /**
-     * `Glide.with(view).clear(view)`: cancels the asynchronous load the host had just started.
-     * Reflection keeps the module free of a compile-time Glide dependency.
+     * `Glide.with(context).clear(view)`: cancels the asynchronous load the host had just started.
+     *
+     * Both the entry point and its `with` are renamed by R8 in this APK (`com.bumptech.glide.a#f`),
+     * so the class is tried by its well-known name first and the call is then resolved by shape —
+     * a static `(Context) -> RequestManager` and an instance `(View) -> void`. Reflection keeps the
+     * module free of a compile-time Glide dependency.
      */
     private fun clearGlideRequest(view: ImageView, classLoader: ClassLoader) {
         runCatching {
-            val glide = Class.forName("com.bumptech.glide.Glide", false, classLoader)
-            val manager = glide.getMethod("with", View::class.java).invoke(null, view)
-            manager?.javaClass?.getMethod("clear", View::class.java)?.invoke(manager, view)
+            val glide = GLIDE_ENTRY_POINTS.firstNotNullOfOrNull { name ->
+                runCatching { Class.forName(name, false, classLoader) }.getOrNull()
+            } ?: return@runCatching
+            val with = glide.methods.firstOrNull { method ->
+                java.lang.reflect.Modifier.isStatic(method.modifiers) &&
+                    method.parameterCount == 1 &&
+                    method.parameterTypes[0] == Context::class.java &&
+                    method.returnType != Void.TYPE
+            } ?: return@runCatching
+            val manager = with.invoke(null, view.context) ?: return@runCatching
+            val clear = manager.javaClass.methods.firstOrNull { method ->
+                method.parameterCount == 1 &&
+                    method.parameterTypes[0] == View::class.java &&
+                    method.returnType == Void.TYPE
+            } ?: return@runCatching
+            clear.invoke(manager, view)
         }
     }
 
@@ -515,18 +580,23 @@ internal class GameAssistantRuntime(
         const val MULTITYPE_ENTRY_GETTER = "b"
 
         const val ANDROID_PACKAGE_PREFIX = "android."
-        const val ROUND_IMAGE_VIEW = "COUIRoundImageView"
 
         /** RecyclerView's holder field; the class itself is obfuscated in this APK. */
         const val ITEM_VIEW_FIELD = "itemView"
 
-        /** The message-box mark is ~18dp; the avatar next to it is 40dp and up. */
-        const val MARK_MIN_DP = 6
-        const val MARK_MAX_DP = 28
+        /**
+         * The row is bound before it is measured — children are 0×0 at bind time — so the mark only
+         * becomes findable after the adapter's layout pass. Cumulative ≈ 0.9 s.
+         */
+        val BADGE_RETRY_DELAYS = longArrayOf(32L, 96L, 240L, 480L)
         const val MAX_MARK_DEPTH = 6
+        const val MAX_REPORTED_MARKS = 6
 
         /** Glide delivers the host's bundled mark a few frames later, so the guard outlives the bind. */
         const val MESSAGE_BADGE_WINDOW_MILLIS = 10_000L
+
+        /** Glide's entry point: the library name, then the R8-renamed one this APK ships. */
+        val GLIDE_ENTRY_POINTS = arrayOf("com.bumptech.glide.Glide", "com.bumptech.glide.a")
 
         /** Prefix of the dock cell's state object; the concrete class name survived 10.43.7. */
         const val GAME_STATE_PACKAGE = "business.gamedock."
@@ -543,6 +613,60 @@ internal class GameAssistantRuntime(
         /** Always installed and always has a themed icon, so a miss means "theme API unavailable". */
         const val PROBE_PACKAGE = "com.android.settings"
         const val PROBE_DELAY_MILLIS = 3_000L
+    }
+}
+
+/** One `ImageView` of a message row, measured once so repeated retries stay cheap. */
+internal class MarkCandidate private constructor(
+    val view: ImageView,
+    val widthDp: Int,
+    val heightDp: Int,
+    val visible: Boolean,
+    private val idName: String,
+) {
+
+    /** The mark is a `COUIRoundImageView`; the shield icon and dividers are plain views. */
+    val round: Boolean = view.javaClass.name.contains(ROUND_IMAGE_VIEW)
+
+    /** The row's app icon is 32dp; the contact picture over its corner is 16dp. */
+    val markSized: Boolean
+        get() {
+            val longest = maxOf(widthDp, heightDp)
+            val shortest = minOf(widthDp, heightDp)
+            return longest in MARK_MIN_DP..MARK_MAX_DP &&
+                longest - shortest <= MARK_SQUARE_TOLERANCE_DP
+        }
+
+    fun describe(): String {
+        val name = if (idName.length > MAX_ID_NAME) idName.take(MAX_ID_NAME) else idName
+        return name + ":" + widthDp + "x" + heightDp + ":" + if (visible) "v" else "h"
+    }
+
+    companion object {
+        fun of(view: ImageView): MarkCandidate {
+            val density = view.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+            return MarkCandidate(
+                view = view,
+                widthDp = (view.width / density).toInt(),
+                heightDp = (view.height / density).toInt(),
+                visible = view.visibility == View.VISIBLE,
+                idName = idNameOf(view),
+            )
+        }
+
+        private fun idNameOf(view: View): String {
+            if (view.id == View.NO_ID) return "no-id"
+            return runCatching { view.resources.getResourceEntryName(view.id) }
+                .getOrElse { "id-0x" + Integer.toHexString(view.id) }
+        }
+
+        private const val ROUND_IMAGE_VIEW = "COUIRoundImageView"
+
+        /** 16dp is the corner picture (out of range); 32dp is the app icon. */
+        private const val MARK_MIN_DP = 24
+        private const val MARK_MAX_DP = 48
+        private const val MARK_SQUARE_TOLERANCE_DP = 8
+        private const val MAX_ID_NAME = 18
     }
 }
 
