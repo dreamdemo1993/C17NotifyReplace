@@ -465,7 +465,8 @@ internal class GameAssistantRuntime(
             attributes = mapOf(
                 "package" to packageName,
                 "stage" to "message_badge_view",
-                "row" to root.javaClass.simpleName + "/" + root.childCount,
+                "row" to root.javaClass.simpleName + "/" +
+                    ((root as? android.view.ViewGroup)?.childCount ?: 0),
                 "views" to describeMarks(root),
             ),
             occurrence = OccurrencePolicy.RateLimited("games:badge_miss", 30_000L),
