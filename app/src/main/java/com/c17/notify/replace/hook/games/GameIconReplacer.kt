@@ -41,6 +41,17 @@ internal class GameIconReplacer(
     }
 
     /**
+     * Whether the theme engine has artwork for this package. Used to pick the real package name out
+     * of a handful of strings the dock's model carries — the one that resolves is the one.
+     */
+    fun hasThemeIcon(packageName: String?): Boolean {
+        val pkg = packageName?.trim().orEmpty()
+        if (pkg.isEmpty() || pkg == SELF_PACKAGE) return false
+        val context = application() ?: return false
+        return themeIcons.resolveByPackage(context, pkg) != null
+    }
+
+    /**
      * One-shot check that the theme API really returns a *different* picture in this process.
      *
      * `UxIconPackageManagerExt` is a framework extension intended for system code; in an ordinary

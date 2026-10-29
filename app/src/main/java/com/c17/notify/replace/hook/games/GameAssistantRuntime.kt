@@ -26,11 +26,12 @@ import org.lsposed.hiddenapibypass.HiddenApiBypass
  * The assistant draws three separate copies of an app's launcher icon while a game is running, and
  * none of them go through SystemUI:
  *
- * - the dock / edge panel app icons — [EDGE_MANAGER]`#u(String)` feeding a Glide loader, bound to
- *   the cell by [EDGE_CELL]`#c(model, position)`;
+ * - the dock / edge panel app icons — `ExternalApplicationManager#u(String)` feeding a Glide
+ *   loader (now `business.secondarypanel.manager.a#f(String)`), bound to the cell by
+ *   [EDGE_CELL]`#c(model, position)` (now `V`);
  * - the "弹幕" chat bubble icon — [BARRAGE_MANAGER]`#loadNotificationIcon(Icon, String, Integer)`;
  * - the app mark next to a contact avatar in the message box —
- *   [MESSAGE_BOX_MANAGER]`#Y(ImageView, MessageData)`.
+ *   `MessageNotificationBoxManager#Y(ImageView, MessageData)`.
  *
  * The launcher-icon hook is the widest of the four and the one that actually catches everything:
  * every `PackageItemInfo#loadIcon` call inside this process answers with the theme icon, so paths
@@ -123,23 +124,22 @@ internal class GameAssistantRuntime(
         }
     }
 
-    /** Dock / edge-panel app icons: `ExternalApplicationManager.u(String): Drawable`. */
+    /**
+     * Dock / edge-panel app icons: `(String): Drawable`.
+     *
+     * 10.43.7 turned this class into `business.secondarypanel.manager.a` and renamed the method to
+     * `f`; the signature is what the lookup anchors on now, see [GameAssistantMembers].
+     */
     private fun installEdgePanelIcons(classLoader: ClassLoader, replacer: GameIconReplacer) {
-        val manager = Reflection.loadClassOrNull(EDGE_MANAGER, classLoader) { cause ->
-            diagnostics.memberMissing(
-                scope = "games:edge_panel_class",
-                message = "未找到游戏助手应用图标管理器，跳过应用栏图标替换",
-                cause = cause,
-            )
-        } ?: return
-        val method = Reflection.findMethod(manager, "u", String::class.java) ?: run {
+        val target = GameAssistantMembers.edgePanelIconLoader(classLoader) ?: run {
             diagnostics.memberMissing(
                 scope = "games:edge_panel_method",
-                message = "未找到 ExternalApplicationManager.u(String)，跳过应用栏图标替换",
+                message = "未找到游戏助手应用图标管理器 (String)->Drawable，跳过应用栏图标替换",
             )
             return
         }
-        hooks.install(method, "games.edge_panel.app_icon") { chain ->
+        reportResolved(SITE_EDGE_PANEL, target.label)
+        hooks.install(target.method, "games.edge_panel.app_icon") { chain ->
             val packageName = chain.args.getOrNull(0) as? String
             replacer.drawableFor(SITE_EDGE_PANEL, packageName) ?: chain.proceed()
         }
@@ -160,19 +160,19 @@ internal class GameAssistantRuntime(
                 cause = cause,
             )
         } ?: return
-        val bind = Reflection.findMethodReturning(cell, BIND_METHOD, Void.TYPE, null, Int::class.javaPrimitiveType)
-            ?: run {
-                diagnostics.memberMissing(
-                    scope = "games:edge_cell_bind",
-                    message = "未找到 GameAppCellView 的绑定方法，跳过应用栏图标接管",
-                )
-                return
-            }
+        val bind = GameAssistantMembers.cellBind(cell) ?: run {
+            diagnostics.memberMissing(
+                scope = "games:edge_cell_bind",
+                message = "未找到 GameAppCellView 的绑定方法 (model, int)，跳过应用栏图标接管",
+            )
+            return
+        }
+        reportResolved(SITE_EDGE_PANEL_CELL, cell.name + "#" + bind.name)
         val iconGetter = Reflection.findMethod(cell, "getIcon")
         hooks.install(bind, "games.edge_panel.cell") { chain ->
             val result = chain.proceed()
             runCatching {
-                val packageName = packageFromModel(chain.args.getOrNull(0))
+                val packageName = packageFromModel(chain.args.getOrNull(0), replacer)
                 val icon = iconGetter?.invoke(chain.instanceOrNull) as? ImageView
                 val themed = packageName?.let { replacer.drawableFor(SITE_EDGE_PANEL, it) }
                 if (icon != null && themed != null) {
@@ -217,15 +217,12 @@ internal class GameAssistantRuntime(
     /**
      * App mark next to the contact avatar in the message box: the host sets a bundled icon resource
      * looked up from the package name.
+     *
+     * 10.43.7 renamed `MessageNotificationBoxManager` and the `Y(ImageView, MessageData)` entry
+     * point is gone from that shape; the lookup keeps trying, and the log says which one it found
+     * or that it found none — the mark then falls back to the host's own artwork.
      */
     private fun installMessageBadge(classLoader: ClassLoader, replacer: GameIconReplacer) {
-        val manager = Reflection.loadClassOrNull(MESSAGE_BOX_MANAGER, classLoader) { cause ->
-            diagnostics.memberMissing(
-                scope = "games:message_box_class",
-                message = "未找到游戏助手消息盒子，跳过消息角标替换",
-                cause = cause,
-            )
-        } ?: return
         val messageData = Reflection.loadClassOrNull(MESSAGE_DATA, classLoader) { cause ->
             diagnostics.memberMissing(
                 scope = "games:message_data_class",
@@ -233,14 +230,15 @@ internal class GameAssistantRuntime(
                 cause = cause,
             )
         } ?: return
-        val method = Reflection.findMethod(manager, "Y", ImageView::class.java, messageData) ?: run {
+        val target = GameAssistantMembers.messageBadgeBinder(classLoader, messageData) ?: run {
             diagnostics.memberMissing(
                 scope = "games:message_badge_method",
-                message = "未找到 MessageNotificationBoxManager.Y，跳过消息角标替换",
+                message = "未找到消息盒子的角标方法 (ImageView, MessageData)，跳过消息角标替换",
             )
             return
         }
-        hooks.install(method, "games.message_box.app_mark") { chain ->
+        reportResolved(SITE_MESSAGE_BADGE, target.label)
+        hooks.install(target.method, "games.message_box.app_mark") { chain ->
             val view = chain.args.getOrNull(0) as? ImageView
             val packageName = notificationPackage(chain.args.getOrNull(1))
             val themed = view?.let { replacer.drawableFor(SITE_MESSAGE_BADGE, packageName) }
@@ -258,6 +256,20 @@ internal class GameAssistantRuntime(
     }
 
     /**
+     * Records which class/method a name-independent lookup settled on: the assistant re-obfuscates
+     * its `business.*` packages on most releases, and without this line a future miss is invisible.
+     */
+    private fun reportResolved(site: String, label: String) {
+        diagnostics.report(
+            level = DiagnosticLevel.Info,
+            event = DiagnosticEvent.GameAssistantHookResolved,
+            message = "游戏助手钩子目标已按签名定位",
+            attributes = mapOf("site" to site, "target" to label),
+            occurrence = OccurrencePolicy.Once("games:resolved:$site"),
+        )
+    }
+
+    /**
      * `Glide.with(view).clear(view)`: cancels the asynchronous load the host had just started.
      * Reflection keeps the module free of a compile-time Glide dependency.
      */
@@ -270,13 +282,42 @@ internal class GameAssistantRuntime(
     }
 
     /**
-     * The dock cell's model (`w1.b`) wraps an `AppItemState`; the package name is
-     * `model.r().B()`. Called reflectively because both names are obfuscated per build.
+     * The dock cell's model carries a `business.gamedock.state.a` whose `m` is the package name.
+     * Both the accessors and the field names are re-obfuscated every release, so the candidates are
+     * collected from the model's shape and the first one the theme engine actually knows wins.
      */
-    private fun packageFromModel(model: Any?): String? {
-        val state = model?.javaClass?.getMethod("r")?.invoke(model) ?: return null
-        return runCatching { state.javaClass.getMethod("B").invoke(state) as? String }.getOrNull()
+    private fun packageFromModel(model: Any?, replacer: GameIconReplacer): String? {
+        val data = model ?: return null
+        val candidates = LinkedHashSet<String>()
+        // 10.42.6 shape: model.r().B()
+        runCatching {
+            val state = data.javaClass.getMethod("r").invoke(data)
+            state?.javaClass?.getMethod("B")?.invoke(state) as? String
+        }.getOrNull()?.let(candidates::add)
+        // 10.43.7 shape: model.<state>.<String>, the state type name is not obfuscated.
+        data.javaClass.declaredFields
+            .filter { field -> field.type.name.startsWith(GAME_STATE_PACKAGE) }
+            .mapNotNull { field -> field.readOrNull(data) }
+            .forEach { state ->
+                state.javaClass.declaredFields
+                    .filter { field -> field.type == String::class.java }
+                    .mapNotNull { field -> field.readOrNull(state) as? String }
+                    .forEach(candidates::add)
+            }
+        // Anything else on the model that looks like a package name.
+        data.javaClass.declaredFields
+            .filter { field -> field.type == String::class.java }
+            .mapNotNull { field -> field.readOrNull(data) as? String }
+            .filter { value -> PACKAGE_SHAPE.matches(value) }
+            .forEach(candidates::add)
+        if (candidates.isEmpty()) return null
+        return candidates.firstOrNull { replacer.hasThemeIcon(it) } ?: candidates.first()
     }
+
+    private fun java.lang.reflect.Field.readOrNull(target: Any): Any? = runCatching {
+        isAccessible = true
+        get(target)
+    }.getOrNull()
 
     private fun notificationPackage(messageData: Any?): String? {
         val data = messageData ?: return null
@@ -287,18 +328,19 @@ internal class GameAssistantRuntime(
     }
 
     private companion object {
-        const val EDGE_MANAGER = "business.secondarypanel.manager.ExternalApplicationManager"
         const val EDGE_CELL = "business.edgepanel.components.widget.view.GameAppCellView"
         const val BARRAGE_MANAGER = "com.oplus.feature.barragenotification.BarrageManager"
-        const val MESSAGE_BOX_MANAGER = "business.mainpanel.welfare.MessageNotificationBoxManager"
         const val MESSAGE_DATA = "business.mainpanel.welfare.MessageData"
         const val THEME_ICON_FRAMEWORK_CLASS = "Landroid/app/UxIconPackageManagerExt;"
 
-        /** `GameAppCellView#c(model, position)`; the model type is obfuscated, hence the wildcard. */
-        const val BIND_METHOD = "c"
+        /** Prefix of the dock cell's state object; the concrete class name survived 10.43.7. */
+        const val GAME_STATE_PACKAGE = "business.gamedock."
+
+        val PACKAGE_SHAPE = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*){1,}")
 
         const val SITE_LAUNCHER_ICON = "launcher_icon"
         const val SITE_EDGE_PANEL = "edge_panel"
+        const val SITE_EDGE_PANEL_CELL = "edge_panel_cell"
         const val SITE_BARRAGE = "barrage"
         const val SITE_MESSAGE_BADGE = "message_badge"
         const val SITE_PROBE = "probe"
