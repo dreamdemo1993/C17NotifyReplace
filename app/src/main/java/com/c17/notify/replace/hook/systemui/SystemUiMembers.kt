@@ -93,6 +93,12 @@ internal data class PanelMembers(
      * through it, including the plain rows the host inflates while the shade is closed.
      */
     val stackOnViewAdded: Method?,
+    /**
+     * `NotificationStackScrollLayout.onLayout(...)` — the shade lays its rows out again on every
+     * expand/collapse. Rows inflated while the shade was closed are only measurable (and only drawn)
+     * from that pass on, which is why an add-time hook alone can miss them.
+     */
+    val stackOnLayout: Method?,
     val groupIconInitIconViewColor: Method?,
     val groupIconInitPillBgAndNumberColor: Method?,
     val groupIconInitEntryIconDrawable: Method?,
@@ -446,6 +452,20 @@ internal object SystemUiMembers {
             Reflection.findMethodReturning(stack, "onViewAdded", Void.TYPE, View::class.java)
                 ?.takeIf { it.declaringClass == stack }
         }
+        // Declaring-class check for the same reason as onViewAdded above: the inherited
+        // ViewGroup.onLayout would fire for every layout in SystemUI.
+        val stackOnLayout = classes.optional(NOTIFICATION_STACK_SCROLL_LAYOUT)?.let { stack ->
+            Reflection.findMethodReturning(
+                stack,
+                "onLayout",
+                Void.TYPE,
+                java.lang.Boolean.TYPE,
+                java.lang.Integer.TYPE,
+                java.lang.Integer.TYPE,
+                java.lang.Integer.TYPE,
+                java.lang.Integer.TYPE,
+            )?.takeIf { it.declaringClass == stack }
+        }
         if (
             oplusGroupWrapper == null ||
             (
@@ -639,6 +659,7 @@ internal object SystemUiMembers {
             childrenContainerContainingNotification = childrenContainerContainingNotification,
             childrenContainerOnViewAdded = childrenContainerOnViewAdded,
             stackOnViewAdded = stackOnViewAdded,
+            stackOnLayout = stackOnLayout,
             expandableRowGetViewWrapper = expandableRowGetViewWrapper,
             groupIconInitIconViewColor = groupIconInitIconViewColor,
             groupIconInitPillBgAndNumberColor = groupIconInitPillBgAndNumberColor,

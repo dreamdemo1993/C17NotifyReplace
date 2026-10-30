@@ -142,6 +142,9 @@ private val TRACED_EVENTS = setOf(
     DiagnosticEvent.HostAvatarReplace,
     DiagnosticEvent.IconReapplied,
     DiagnosticEvent.PackageIconResolved,
+    // Rate-limited to one line per reason per minute, and the only record that tells "the row was
+    // never reached" apart from "we wrote and the host took the icon back".
+    DiagnosticEvent.PanelRowSkipped,
     DiagnosticEvent.GameAssistantIconReplaced,
     DiagnosticEvent.GameAssistantIconSkipped,
     DiagnosticEvent.GameAssistantIconSelfCheck,

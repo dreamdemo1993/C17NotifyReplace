@@ -74,6 +74,7 @@ internal class NotificationPanelHooks(
         installPackageIconByNameHooks()
         installHiddenContentHooks()
         installChildrenContainerHooks()
+        installStackLayoutSweep()
         members.headerOnContentUpdated?.let { method ->
             hooks.install(method, "systemui.panel.header.onContentUpdated") { chain ->
                 val result = chain.proceed()
@@ -249,7 +250,165 @@ internal class NotificationPanelHooks(
                 delay,
             )
         }
+        // The three timed passes above are all the rows added *while the shade is open* need. A row
+        // the host inflates with the shade closed is a different story: it is added before its
+        // entry is bound and before it has any size, so all three passes run against a row that is
+        // not yet measurable, and nothing ever looks at it again — that is the "拼多多的老消息还是
+        // 原生图标，重启 SystemUI 才好" report. So arm a pass on the first frame the row is really
+        // drawn: by then it is bound, measured and on screen, which is exactly the host's write
+        // window.
+        armRowIconOnFirstDraw(row, rowWrapper, snapshot)
     }
+
+    /** Rows that already carry a draw-time pass, so repeated `onViewAdded` calls stay cheap. */
+    private val rowDrawArmed = java.util.WeakHashMap<View, Boolean>()
+
+    /**
+     * Applies the row's icon on the first frames it is drawn, retrying a bounded number of times.
+     *
+     * Pre-draw is the one callback that fires only for rows the user can actually see, so a row the
+     * host built while the shade was closed gets its icon the moment the shade opens instead of
+     * waiting for the next bind — which for an old notification may never come.
+     */
+    private fun armRowIconOnFirstDraw(row: View, rowWrapper: Method, snapshot: RuntimeSnapshot) {
+        // Rows the bind-time hooks already handled (most of them) need no guarding, and skipping
+        // them here is what keeps this cheap: a row yielded to a contact photo would otherwise be
+        // re-resolved on every attempt.
+        if (!rowNeedsDrawPass(row, rowWrapper)) return
+        synchronized(rowDrawArmed) {
+            if (rowDrawArmed.put(row, true) != null) return
+        }
+        var attempts = 0
+        var lastAttemptAt = 0L
+        val listener = object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                val observer = row.viewTreeObserver
+                val now = SystemClock.uptimeMillis()
+                val done = !configuration.isCurrent(snapshot) ||
+                    !row.isAttachedToWindow ||
+                    attempts >= MAX_ROW_DRAW_ATTEMPTS
+                if (!done && (attempts == 0 || now - lastAttemptAt >= ROW_DRAW_RETRY_INTERVAL_MILLIS)) {
+                    attempts++
+                    lastAttemptAt = now
+                    val applied = try {
+                        reapplyRowIcon(row, rowWrapper)
+                    } catch (exception: Exception) {
+                        diagnostics.runtimeFailure(
+                            scope = "panel:row_first_draw",
+                            message = "分组子行首次绘制时补铺图标失败",
+                            cause = exception,
+                            revision = snapshot.revision,
+                        )
+                        false
+                    }
+                    if (applied) {
+                        forgetRowDrawPass(observer, this, row)
+                        return true
+                    }
+                }
+                if (done) forgetRowDrawPass(observer, this, row)
+                return true
+            }
+        }
+        row.viewTreeObserver.addOnPreDrawListener(listener)
+        // A recycled row keeps its listener until the view is detached; drop it there so the
+        // listener never outlives the row it was armed for.
+        row.addOnAttachStateChangeListener(
+            object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(view: View) = Unit
+
+                override fun onViewDetachedFromWindow(view: View) {
+                    view.removeOnAttachStateChangeListener(this)
+                    forgetRowDrawPass(view.viewTreeObserver, listener, view)
+                }
+            },
+        )
+    }
+
+    private fun forgetRowDrawPass(observer: ViewTreeObserver, listener: ViewTreeObserver.OnPreDrawListener, row: View) {
+        if (observer.isAlive) observer.removeOnPreDrawListener(listener)
+        synchronized(rowDrawArmed) { rowDrawArmed.remove(row) }
+    }
+
+    /**
+     * Whether a row still needs a draw-time pass.
+     *
+     * False for rows the bind-time hooks already own (the common case) and for rows whose slot
+     * belongs to the host's own contact photo — arming those would only re-resolve an avatar
+     * composition on every attempt.
+     */
+    private fun rowNeedsDrawPass(row: View, rowWrapper: Method): Boolean = runCatching {
+        val wrapper = rowWrapper.invoke(row) ?: return@runCatching true
+        if (wrapper.iconTarget != PanelIconTarget.Header) return@runCatching false
+        val icon = members.headerGetIcon?.invoke(wrapper) as? ImageView ?: return@runCatching true
+        val shown = icon.drawable ?: return@runCatching true
+        val sbn = statusBarNotificationFromRow(row) ?: return@runCatching true
+        if (headerIconClaims.isCurrentClaim(icon, sbn.key, shown)) return@runCatching false
+        // A sender photo belongs to the host; [HostAvatarPresence] is the same verdict the resolver
+        // uses, so this stays in sync with the yield rules.
+        if (sbn.notification != null && HostAvatarPresence.evaluate(icon.context, sbn).renderable) {
+            return@runCatching false
+        }
+        true
+    }.getOrDefault(false)
+
+    /**
+     * `NotificationStackScrollLayout.onLayout`: arms a draw-time pass for every row in the list,
+     * including the ones already sitting in a group's children container. Without it a row whose
+     * `onViewAdded` fired while the shade was closed would never be looked at again.
+     */
+    private fun installStackLayoutSweep() {
+        val method = members.stackOnLayout ?: return
+        val rowWrapper = members.expandableRowGetViewWrapper ?: return
+        val rowClass = members.expandableRowGetEntry.declaringClass
+        hooks.install(method, "systemui.panel.stack.onLayout") { chain ->
+            val result = chain.proceed()
+            val stack = chain.instanceOrNull as? View
+            if (stack != null) {
+                val now = SystemClock.uptimeMillis()
+                if (now - lastStackSweepAt >= STACK_SWEEP_INTERVAL_MILLIS) {
+                    lastStackSweepAt = now
+                    try {
+                        sweepRowsForDrawPass(stack, rowClass, rowWrapper)
+                    } catch (exception: Exception) {
+                        diagnostics.runtimeFailure(
+                            scope = "panel:stack_sweep",
+                            message = "遍历通知列表补铺图标失败",
+                            cause = exception,
+                            revision = configuration.snapshot.revision,
+                        )
+                    }
+                }
+            }
+            result
+        }
+    }
+
+    private fun sweepRowsForDrawPass(root: View, rowClass: Class<*>, rowWrapper: Method) {
+        val snapshot = configuration.snapshot
+        if (!snapshot.config.panelIconReplacementEnabled) return
+        val pending = ArrayDeque<View>()
+        pending.addLast(root)
+        var depth = 0
+        var visited = 0
+        while (pending.isNotEmpty() && depth <= MAX_SWEEP_DEPTH && visited < MAX_SWEEP_VIEWS) {
+            var level = pending.size
+            while (level-- > 0 && visited < MAX_SWEEP_VIEWS) {
+                val view = pending.removeFirst()
+                visited++
+                if (rowClass.isInstance(view)) armRowIconOnFirstDraw(view, rowWrapper, snapshot)
+                // Keep descending: a group's children container is a child of its own row, so the
+                // rows inside it are only reachable *through* the row.
+                if (view is ViewGroup) {
+                    for (index in 0 until view.childCount) pending.addLast(view.getChildAt(index))
+                }
+            }
+            depth++
+        }
+    }
+
+    @Volatile
+    private var lastStackSweepAt = 0L
 
     private fun reportChildrenHookMissing(onViewAdded: Method?, stackOnViewAdded: Method?) {
         diagnostics.memberMissing(
@@ -259,8 +418,12 @@ internal class NotificationPanelHooks(
         )
     }
 
-    private fun reapplyRowIcon(row: View, rowWrapper: Method) {
-        if (!row.isAttachedToWindow) return
+    /**
+     * @return true when the row's icon is now the module's (either written by this pass or already
+     * owned), so a draw-time caller knows it can stop.
+     */
+    private fun reapplyRowIcon(row: View, rowWrapper: Method): Boolean {
+        if (!row.isAttachedToWindow) return false
         val wrapper = try {
             rowWrapper.invoke(row)
         } catch (exception: Exception) {
@@ -270,17 +433,21 @@ internal class NotificationPanelHooks(
                 cause = exception,
                 revision = configuration.snapshot.revision,
             )
-            return
-        } ?: return
+            return false
+        } ?: return false
         // The collapsed summary has its own hooks (initIcon / flushIcon) which already hold a
         // long-lived guard for it; running this pass on top would stack a second one per regroup.
-        if (wrapper.iconTarget != PanelIconTarget.Header) return
+        if (wrapper.iconTarget != PanelIconTarget.Header) return false
         applyPanelIcon(
             wrapper = wrapper,
             rowCandidate = row,
             target = PanelIconTarget.Header,
             skipIfAlreadyApplied = true,
         )
+        val icon = members.headerGetIcon?.invoke(wrapper) as? ImageView ?: return false
+        val shown = icon.drawable ?: return false
+        val key = statusBarNotificationFromRow(row)?.key ?: return false
+        return headerIconClaims.isCurrentClaim(icon, key, shown)
     }
 
     /**
@@ -2590,6 +2757,21 @@ internal class NotificationPanelHooks(
          * and the entry being bound late. Delays are absolute, not cumulative.
          */
         val CHILD_ROW_REAPPLY_DELAYS = longArrayOf(0L, 320L, 1000L)
+
+        /**
+         * Draw-time retries for a row the host inflated while the shade was closed. The row only
+         * becomes bound and measurable once it is on screen, and the host may still be finishing
+         * its own bind on the first frames, so a handful of spaced attempts is enough.
+         */
+        const val MAX_ROW_DRAW_ATTEMPTS = 8
+        const val ROW_DRAW_RETRY_INTERVAL_MILLIS = 300L
+
+        /** `onLayout` fires on every expand/collapse; one sweep per half second is plenty. */
+        const val STACK_SWEEP_INTERVAL_MILLIS = 500L
+
+        /** The list → row → children container chain, nothing deeper. */
+        const val MAX_SWEEP_DEPTH = 3
+        const val MAX_SWEEP_VIEWS = 240
 
         /**
          * How many repair passes the draw-time guard logs before it goes quiet. It never stops
