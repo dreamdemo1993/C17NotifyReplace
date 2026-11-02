@@ -45,10 +45,12 @@ internal class OplusIconConfigurationReader(
 
     /** Either the accessor method or the backing field, resolved once per Configuration class. */
     private class ExtraAccessor(val method: Method?, val field: Field?) {
-        fun read(target: Configuration): Any? = when {
-            method != null -> runCatching { method.invoke(target) }.getOrNull()
-            field != null -> runCatching { field.get(target) }.getOrNull()
-            else -> null
+        fun read(target: Configuration): Any? {
+            val accessor = method
+            if (accessor != null) return runCatching { accessor.invoke(target) }.getOrNull()
+            val backing = field
+            if (backing != null) return runCatching { backing.get(target) }.getOrNull()
+            return null
         }
     }
 
@@ -103,10 +105,12 @@ internal class OplusIconConfigurationReader(
 
     /** Either the backing field or its accessor, resolved once per extra-configuration class. */
     private class LongAccessor(val field: Field?, val method: Method?) {
-        fun read(target: Any): Long? = when {
-            field != null -> runCatching { (field.get(target) as? Number)?.toLong() }.getOrNull()
-            method != null -> runCatching { (method.invoke(target) as? Number)?.toLong() }.getOrNull()
-            else -> null
+        fun read(target: Any): Long? {
+            val backing = field
+            if (backing != null) return runCatching { (backing.get(target) as? Number)?.toLong() }.getOrNull()
+            val accessor = method
+            if (accessor != null) return runCatching { (accessor.invoke(target) as? Number)?.toLong() }.getOrNull()
+            return null
         }
     }
 
