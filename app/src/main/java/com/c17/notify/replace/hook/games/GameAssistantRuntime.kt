@@ -538,36 +538,63 @@ internal class GameAssistantRuntime(
      */
     private fun packageFromModel(model: Any?, replacer: GameIconReplacer): String? {
         val data = model ?: return null
+        val shape = modelShape(data.javaClass)
         val candidates = LinkedHashSet<String>()
-        // 10.42.6 shape: model.r().B()
-        runCatching {
-            val state = data.javaClass.getMethod("r").invoke(data)
-            state?.javaClass?.getMethod("B")?.invoke(state) as? String
-        }.getOrNull()?.let(candidates::add)
+        // 10.42.6 shape: model.r().B(). On 10.43.7 the getter is gone, and asking for it throws —
+        // which used to cost a thrown NoSuchMethodException on every bound cell.
+        shape.legacyStateGetter?.let { getter ->
+            val name = runCatching {
+                val state = getter.invoke(data) ?: return@runCatching null
+                state.javaClass.getMethod("B").invoke(state) as? String
+            }.getOrNull()
+            if (name != null) candidates.add(name)
+        }
         // 10.43.7 shape: model.<state>.<String>, the state type name is not obfuscated.
-        data.javaClass.declaredFields
-            .filter { field -> field.type.name.startsWith(GAME_STATE_PACKAGE) }
-            .mapNotNull { field -> field.readOrNull(data) }
-            .forEach { state ->
-                state.javaClass.declaredFields
-                    .filter { field -> field.type == String::class.java }
-                    .mapNotNull { field -> field.readOrNull(state) as? String }
-                    .forEach(candidates::add)
+        for (field in shape.stateFields) {
+            val state = field.readOrNull(data) ?: continue
+            for (stringField in stringFieldsOf(state.javaClass)) {
+                (stringField.readOrNull(state) as? String)?.let(candidates::add)
             }
+        }
         // Anything else on the model that looks like a package name.
-        data.javaClass.declaredFields
-            .filter { field -> field.type == String::class.java }
-            .mapNotNull { field -> field.readOrNull(data) as? String }
-            .filter { value -> PACKAGE_SHAPE.matches(value) }
-            .forEach(candidates::add)
+        for (field in shape.stringFields) {
+            val value = field.readOrNull(data) as? String ?: continue
+            if (PACKAGE_SHAPE.matches(value)) candidates.add(value)
+        }
         if (candidates.isEmpty()) return null
         return candidates.firstOrNull { replacer.hasThemeIcon(it) } ?: candidates.first()
     }
 
-    private fun java.lang.reflect.Field.readOrNull(target: Any): Any? = runCatching {
-        isAccessible = true
-        get(target)
-    }.getOrNull()
+    /** Reflected shape of a dock model, built once per class instead of once per bound cell. */
+    private class ModelShape(
+        val legacyStateGetter: java.lang.reflect.Method?,
+        val stateFields: Array<java.lang.reflect.Field>,
+        val stringFields: Array<java.lang.reflect.Field>,
+    )
+
+    private val modelShapes = java.util.concurrent.ConcurrentHashMap<Class<*>, ModelShape>()
+    private val stateStringFields = java.util.concurrent.ConcurrentHashMap<Class<*>, Array<java.lang.reflect.Field>>()
+
+    private fun modelShape(owner: Class<*>): ModelShape = modelShapes.getOrPut(owner) {
+        val getter = runCatching { owner.getMethod("r") }.getOrNull()
+        val fields = owner.declaredFields.onEach { field -> runCatching { field.isAccessible = true } }
+        ModelShape(
+            legacyStateGetter = getter,
+            stateFields = fields.filter { it.type.name.startsWith(GAME_STATE_PACKAGE) }.toTypedArray(),
+            stringFields = fields.filter { it.type == String::class.java }.toTypedArray(),
+        )
+    }
+
+    private fun stringFieldsOf(owner: Class<*>): Array<java.lang.reflect.Field> =
+        stateStringFields.getOrPut(owner) {
+            owner.declaredFields
+                .filter { it.type == String::class.java }
+                .onEach { field -> runCatching { field.isAccessible = true } }
+                .toTypedArray()
+        }
+
+    /** Fields come from the per-class caches above, which already made them accessible. */
+    private fun java.lang.reflect.Field.readOrNull(target: Any): Any? = runCatching { get(target) }.getOrNull()
 
     private fun notificationPackage(messageData: Any?): String? {
         val data = messageData ?: return null
@@ -675,9 +702,15 @@ internal class MarkCandidate private constructor(
 
         private fun idNameOf(view: View): String {
             if (view.id == View.NO_ID) return "no-id"
+            // `getResourceEntryName` walks the resource table; the retry ladder re-measures the same
+            // images up to five times per bound row, so the answer is cached by id.
+            idNames.get(view.id)?.let { return it }
             return runCatching { view.resources.getResourceEntryName(view.id) }
                 .getOrElse { "id-0x" + Integer.toHexString(view.id) }
+                .also { idNames.put(view.id, it) }
         }
+
+        private val idNames = android.util.LruCache<Int, String>(128)
 
         private const val ROUND_IMAGE_VIEW = "COUIRoundImageView"
         private const val AVATAR = "avatar"

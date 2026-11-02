@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.os.SystemClock
 import com.c17.notify.replace.diagnostics.DiagnosticEvent
 import com.c17.notify.replace.diagnostics.DiagnosticLevel
 import com.c17.notify.replace.diagnostics.Diagnostics
@@ -28,11 +29,14 @@ internal class GameIconReplacer(
     private val application: () -> Context?,
 ) {
 
+    /** Packages the theme engine had no artwork for, with the time the answer may be re-asked. */
+    private val missUntil = android.util.LruCache<String, Long>(MAX_CACHED_MISSES)
+
     fun drawableFor(site: String, packageName: String?): Drawable? {
         val pkg = packageName?.trim().orEmpty()
         if (pkg.isEmpty() || pkg == SELF_PACKAGE) return null
         val context = application() ?: return null
-        val bitmap = themeIcons.resolveByPackage(context, pkg) ?: run {
+        val bitmap = bitmapFor(context, pkg) ?: run {
             traceMiss(site, pkg)
             return null
         }
@@ -48,7 +52,28 @@ internal class GameIconReplacer(
         val pkg = packageName?.trim().orEmpty()
         if (pkg.isEmpty() || pkg == SELF_PACKAGE) return false
         val context = application() ?: return false
-        return themeIcons.resolveByPackage(context, pkg) != null
+        return bitmapFor(context, pkg) != null
+    }
+
+    /**
+     * [ThemeIconProvider] caches hits for a long time but misses for exactly one second — the shade
+     * needs that so a cold theme engine is retried quickly. A scrolling app strip calls this several
+     * times per bound cell, and every cache miss there is a real cross-process call into the theme
+     * service on the UI thread, which is what made scrolling the app-icon strip stutter. A miss is
+     * therefore remembered locally for [MISS_TTL_MILLIS]: long enough to stop hammering the service
+     * while a list is being flung, short enough that a theme switch or a slow engine recovers.
+     */
+    private fun bitmapFor(context: Context, pkg: String): Bitmap? {
+        val now = SystemClock.elapsedRealtime()
+        val cachedMissUntil = missUntil.get(pkg)
+        if (cachedMissUntil != null && cachedMissUntil > now) return null
+        val bitmap = themeIcons.resolveByPackage(context, pkg)
+        if (bitmap == null) {
+            missUntil.put(pkg, now + MISS_TTL_MILLIS)
+        } else {
+            missUntil.remove(pkg)
+        }
+        return bitmap
     }
 
     /**
@@ -156,6 +181,10 @@ internal class GameIconReplacer(
     private companion object {
         const val SELF_PACKAGE = "com.oplus.games"
         const val TRACE_INTERVAL_MILLIS = 2_000L
+
+        /** Long enough to survive a flung list, short enough for a theme switch to be picked up. */
+        const val MISS_TTL_MILLIS = 10_000L
+        const val MAX_CACHED_MISSES = 64
 
         const val SIZE = 16
         const val MARGIN = 3
