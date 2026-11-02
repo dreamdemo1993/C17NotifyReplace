@@ -152,7 +152,12 @@ internal class NotificationIconResolver(
         // ColorOS renders the "personal avatar + app-icon badge" composition itself for the picked
         // packages. Leave those rows, banner cards and lock-screen capsules untouched — but only
         // when this notification has an avatar for the host to compose (see the resolver method).
-        if (shouldYieldToHostAvatar(context, sbn.packageName, sbn)) return@resolveOrFallback null
+        // Rule for the shade: a row with a sender photo keeps "avatar + themed badge" only while
+        // it stands on its own. The aggregated row ("[2条] …") is always the themed app icon,
+        // even when the aggregate ships a photo of its own, so it must not yield here.
+        if (!HostAvatarPresence.isGroupSummary(sbn) &&
+            shouldYieldToHostAvatar(context, sbn.packageName, sbn)
+        ) return@resolveOrFallback null
         if (
             !NotificationIconPolicy.shouldProcessPanel(
                 config = policyConfig,
@@ -185,14 +190,12 @@ internal class NotificationIconResolver(
         sbn: StatusBarNotification,
         originalSmallIcon: Icon?,
     ): PanelIconRenderPlan? = resolveOrFallback("panel", "通知面板图标解析失败") {
-        // A collapsed group can still carry a real sender photo in its large icon (WeCom and
-        // WorkBuddy post one for the aggregate row). ColorOS composes "avatar + badge" for it by
-        // itself, so painting the theme icon there would fight the host: the row would flip between
-        // the theme icon and the avatar every time GroupIconManager repaints — exactly the "图标跳
-        // 变成个人头像+角标" flicker. Yield to the host whenever there is a photo to compose; the
-        // corner badge is already the theme icon through the composition hook.
-        val avatar = HostAvatarPresence.evaluate(context, sbn, allowGroupSummaryAvatar = true)
-        if (avatar.renderable) return@resolveOrFallback null
+        // The aggregated row always shows the themed app icon — that is the rule for the shade,
+        // and it holds even when the aggregate ships a real sender photo in its large icon
+        // (WeCom / WorkBuddy do). An earlier revision yielded there and let the host compose
+        // "avatar + badge", which both contradicted the rule and made the row flip between the
+        // two pictures on every GroupIconManager repaint. The row's IconTakeover re-applies the
+        // themed plan whenever the host repaints, so the themed icon now simply stays.
         // No "keep the original small icon" fallback here. On a collapsed group that fallback is
         // exactly the bug it looks like: the monochrome notification mask (SMS: a plain white
         // speech bubble) painted straight into the icon box, with the host then deriving the pill

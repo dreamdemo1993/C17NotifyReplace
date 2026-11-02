@@ -850,7 +850,7 @@ internal class NotificationPanelHooks(
                                 context = context,
                                 sbn = rowSbn,
                                 contentSizePx = size,
-                                allowGroupSummaryAvatar = HostAvatarPresence.isGroupSummary(rowSbn),
+                                allowGroupSummaryAvatar = false,
                             )
                         }
                         if (prefilled != null) {
@@ -884,80 +884,23 @@ internal class NotificationPanelHooks(
                     return@install hosted
                 }
                 // An aggregated row ("[2条] …") is flagged as a group summary, so the renderable
-                // branch above never takes it — and the host has no avatar composition for a
-                // summary either, it paints the plain app icon. When the headline account behind
-                // the aggregate still ships its own picture in the large icon, compose it here:
-                // otherwise the row keeps the app icon while every single-chat row beside it shows
-                // "avatar + badge".
+                // branch above never takes it. It falls through to the themed replacement below
+                // even when the aggregate ships a real sender photo: the shade rule is "aggregated
+                // = themed app icon, standalone = avatar + themed badge". Composing an avatar for
+                // it here (the old behaviour) also fought the row's own IconTakeover, which holds
+                // the themed plan and re-applied it over the photo on every host repaint.
                 if (HostAvatarPresence.isGroupSummary(rowSbn)) {
-                    val summaryVerdict = HostAvatarPresence.evaluate(
-                        context = context,
-                        sbn = rowSbn,
-                        allowGroupSummaryAvatar = true,
+                    diagnostics.report(
+                        level = DiagnosticLevel.Debug,
+                        event = DiagnosticEvent.PackageIconResolved,
+                        message = "角标诊断：$packageName 聚合摘要按主题图标替换（聚合行不显示头像）",
+                        attributes = mapOf(
+                            "package" to packageName,
+                            "key" to rowSbn.key,
+                            "verdict" to verdict.reason,
+                        ),
+                        occurrence = OccurrencePolicy.Once("header_badge_summary_plain:${rowSbn.key}"),
                     )
-                    if (summaryVerdict.renderable) {
-                        val hosted = chain.proceed() as? Drawable
-                        val size = hosted?.intrinsicWidth?.takeIf { it > 0 }
-                            ?: snapshot.resolver.resolveThemeDrawableByPackage(context, packageName)
-                                ?.intrinsicWidth
-                                ?.takeIf { it > 0 }
-                            ?: 0
-                        val composed = if (size > 0) {
-                            snapshot.resolver.composeHostAvatarPreview(
-                                context = context,
-                                sbn = rowSbn,
-                                contentSizePx = size,
-                                allowGroupSummaryAvatar = true,
-                            )
-                        } else {
-                            null
-                        }
-                        if (composed != null) {
-                            diagnostics.report(
-                                level = DiagnosticLevel.Info,
-                                event = DiagnosticEvent.PackageIconResolved,
-                                message = "角标诊断：$packageName 聚合摘要带真头像，按头像+角标合成",
-                                attributes = mapOf(
-                                    "package" to packageName,
-                                    "key" to rowSbn.key,
-                                    "verdict" to summaryVerdict.reason,
-                                    "difference" to summaryVerdict.difference.toString(),
-                                    "size" to size.toString(),
-                                ),
-                                occurrence = OccurrencePolicy.Once("header_badge_summary_avatar:${rowSbn.key}"),
-                            )
-                            return@install composed
-                        }
-                        diagnostics.report(
-                            level = DiagnosticLevel.Debug,
-                            event = DiagnosticEvent.PackageIconResolved,
-                            message = "角标诊断：$packageName 聚合摘要判定为有头像但合成失败，交给宿主",
-                            attributes = mapOf(
-                                "package" to packageName,
-                                "key" to rowSbn.key,
-                                "size" to size.toString(),
-                            ),
-                            occurrence = OccurrencePolicy.Once("header_badge_summary_failed:${rowSbn.key}"),
-                        )
-                        // The row *has* a photo, only this module cannot compose it (not an
-                        // avatar-priority package, undecodable artwork, ...). Falling through to the
-                        // theme icon would paint over the avatar the host is about to compose — the
-                        // "theme icon ↔ avatar+角标" flip. Hand the row back instead.
-                        return@install chain.proceed()
-                    } else {
-                        diagnostics.report(
-                            level = DiagnosticLevel.Debug,
-                            event = DiagnosticEvent.PackageIconResolved,
-                            message = "角标诊断：$packageName 聚合摘要没有头像位，按主题图标替换",
-                            attributes = mapOf(
-                                "package" to packageName,
-                                "key" to rowSbn.key,
-                                "verdict" to summaryVerdict.reason,
-                                "difference" to summaryVerdict.difference.toString(),
-                            ),
-                            occurrence = OccurrencePolicy.Once("header_badge_summary_plain:${rowSbn.key}"),
-                        )
-                    }
                 }
                 // A row whose notification carries no large icon never gets a host-composed photo
                 // (every logged contact-photo verdict had a largeIcon; the rows without one had
@@ -2184,6 +2127,15 @@ internal class NotificationPanelHooks(
                     )
                     return@postDelayed
                 }
+                // Cold-start gate: composing needs the remote config *and* the themed badge, and
+                // on a fresh SystemUI both can still be missing while the slot legitimately shows
+                // the bare glyph. Giving up here pins the theme icon for good — the force-installed
+                // guard makes every later pass return at the `guards[icon] != null` check — so a
+                // notification that carries avatar material simply waits for the next pass. Only
+                // the last pass may fall back, and by then the warm-up ladder has had ~3s.
+                if (index < HOST_AVATAR_GRACE_MILLIS.lastIndex && HostAvatarPresence.contains(sbn)) {
+                    return@postDelayed
+                }
                 diagnostics.report(
                     level = DiagnosticLevel.Info,
                     event = DiagnosticEvent.HostAvatarReplace,
@@ -2250,12 +2202,12 @@ internal class NotificationPanelHooks(
             }
         }
         if (size <= 0) return@runCatching null
-        val summary = HostAvatarPresence.isGroupSummary(sbn)
+        // Aggregated rows always take the themed icon, so a summary never composes an avatar.
         snapshot.resolver.composeHostAvatarPreview(
             context = icon.context,
             sbn = sbn,
             contentSizePx = size,
-            allowGroupSummaryAvatar = summary,
+            allowGroupSummaryAvatar = false,
         )?.also { lastHeaderContentSizePx = size }
     }.getOrNull()
 
@@ -2400,7 +2352,12 @@ internal class NotificationPanelHooks(
             // Anything else on screen is either the host's own placeholder or real content (a
             // contact photo, or the "photo + badge" composition it built around one). Only the
             // former may be covered; the latter wins and the guard is done.
-            if (!isHostPlaceholder(current)) {
+            //
+            // Exception: an aggregated row is themed *by rule*, even when the host composed a
+            // genuine "photo + badge" for it. Yielding there handed the row back to the host's
+            // composition and the two pictures alternated on every repaint, so for a summary the
+            // guard keeps re-applying the themed plan exactly like the group IconTakeover does.
+            if (!HostAvatarPresence.isGroupSummary(sbn) && !isHostPlaceholder(current)) {
                 reportYieldedSlot(current)
                 stop()
                 return true
@@ -2703,7 +2660,7 @@ internal class NotificationPanelHooks(
                 context = icon.context,
                 sbn = sbn,
                 contentSizePx = size,
-                allowGroupSummaryAvatar = summary,
+                allowGroupSummaryAvatar = false,
             )
             if (drawable == null) {
                 // The sender photo can land a beat after the row is first bound: WeChat posts the
@@ -2711,7 +2668,7 @@ internal class NotificationPanelHooks(
                 // paints the plain app icon until its own composition lands. Retry briefly instead
                 // of waiting for that coroutine — the row then turns into the avatar within a
                 // couple of hundred milliseconds instead of "一闪而过".
-                val verdict = HostAvatarPresence.evaluate(icon.context, sbn, summary)
+                val verdict = HostAvatarPresence.evaluate(icon.context, sbn)
                 diagnostics.report(
                     level = DiagnosticLevel.Debug,
                     event = DiagnosticEvent.HostAvatarPrefill,
@@ -2792,7 +2749,7 @@ internal class NotificationPanelHooks(
                     context = icon.context,
                     sbn = current,
                     contentSizePx = size,
-                    allowGroupSummaryAvatar = summary,
+                    allowGroupSummaryAvatar = false,
                 )
                 if (drawable == null) {
                     scheduleAvatarRefill(icon, wrapper, current, snapshot, attempt + 1)
