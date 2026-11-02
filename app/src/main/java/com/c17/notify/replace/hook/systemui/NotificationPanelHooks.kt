@@ -1669,6 +1669,17 @@ internal class NotificationPanelHooks(
                 // Yielding to the host avatar. ColorOS composes that avatar asynchronously, so the
                 // row would paint the plain small icon first; pre-compose it here instead.
                 if (target == PanelIconTarget.Header) {
+                    // An earlier bind of this very icon may have reached the opposite conclusion
+                    // ("no avatar in this notification") and installed the themed-icon guard. That
+                    // guard is bound to the previous `StatusBarNotification` and survives the
+                    // rebind, so it kept repainting the theme icon over the avatar that arrived
+                    // with the re-post — the row stayed on the theme icon for the whole session
+                    // (report: 「第一条消息直接变成了主题图标 没有头像」, WeChat posts the message
+                    // first and the sender photo ~9s later). Once the row yields the slot belongs
+                    // to the host; the ladder below re-arms a guard if the host still draws nothing.
+                    if (HostAvatarPresence.evaluate(icon.context, sbn).renderable) {
+                        headerPlaceholderGuards.remove(icon)?.stop()
+                    }
                     prefillHostAvatar(icon, wrapper, sbn, snapshot)
                     // plan is null here only when the theme engine itself failed (a yield would
                     // have produced a replacement plan for every no-avatar row since 5.4). The
@@ -1679,7 +1690,7 @@ internal class NotificationPanelHooks(
                     // [canRenderAvatar] is a *prediction*; when it says "photo" the guard installs
                     // late instead of not at all, so a host that never paints the photo cannot
                     // leave the row on its raw icon.
-                    guardHeaderIfHostSkipsAvatar(icon, row, sbn, snapshot)
+                    guardHeaderIfHostSkipsAvatar(icon, row, sbn, snapshot, wrapper)
                 }
                 // An aggregated row that just yielded still has to end up with *something*: when
                 // the host has no photo to compose it paints its own monochrome artwork, and for
@@ -2113,6 +2124,8 @@ internal class NotificationPanelHooks(
         row: Any?,
         sbn: StatusBarNotification,
         snapshot: RuntimeSnapshot,
+        /** The view wrapper this icon belongs to; only used to ask the host for its content size. */
+        wrapper: Any? = null,
     ) {
         if (!HostAvatarPresence.evaluate(icon.context, sbn).renderable) {
             guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot)
@@ -2142,6 +2155,32 @@ internal class NotificationPanelHooks(
                                 "${current.intrinsicWidth}x${current.intrinsicHeight}",
                         ),
                         occurrence = OccurrencePolicy.Once("host_avatar_landed:${sbn.key}"),
+                    )
+                    return@postDelayed
+                }
+                // The slot still holds the bare glyph, but the photo may well be sitting in the
+                // notification while the host's composition lost the race (or its cache still
+                // holds a placeholder-era result). Compose that avatar here instead of dropping to
+                // the theme icon: a row that *has* a sender photo must never be turned into a
+                // themed badge, which is exactly what the blind fallback did (report: 「第一条消息
+                // 直接变成了主题图标 没有头像」— WeChat re-posts with the photo ~9s after the post,
+                // the re-post yielded and this ladder then overwrote the row with the theme icon).
+                val composed = composeAvatarForIcon(icon, wrapper, sbn, snapshot)
+                if (composed != null) {
+                    icon.clearColorFilter()
+                    icon.imageTintList = null
+                    icon.setImageDrawable(composed)
+                    diagnostics.report(
+                        level = DiagnosticLevel.Info,
+                        event = DiagnosticEvent.HostAvatarReplace,
+                        message = "角标诊断：${sbn.packageName} 头像位仍是原样图标，" +
+                            "改用本模块预合成的头像",
+                        attributes = mapOf(
+                            "package" to sbn.packageName,
+                            "key" to sbn.key,
+                            "pass" to index.toString(),
+                        ),
+                        occurrence = OccurrencePolicy.Once("host_avatar_composed:${sbn.key}"),
                     )
                     return@postDelayed
                 }
@@ -2185,6 +2224,40 @@ internal class NotificationPanelHooks(
             HostAvatarPresence.looksLikeLauncherIcon(context, sbn.packageName, drawable) ||
             HostAvatarPresence.looksBlank(drawable) ||
             HostAvatarPresence.looksLikeMonochromeMask(drawable)
+
+    /**
+     * The "contact photo + app-icon badge" picture for [sbn], built with the host's own composer.
+     *
+     * Used as the repair *before* the theme-icon fallback: as long as the notification carries an
+     * avatar there is no reason to strip it from the row, and a row that lost its photo to a race
+     * is exactly the case where the host's cached composition is stale but the notification is
+     * fine. Returns null when there is nothing to compose (no large icon / not a picked package /
+     * theme engine still cold) — the caller then falls back to the themed icon as before.
+     */
+    private fun composeAvatarForIcon(
+        icon: ImageView,
+        wrapper: Any?,
+        sbn: StatusBarNotification,
+        snapshot: RuntimeSnapshot,
+    ): Drawable? = runCatching {
+        val size = if (wrapper != null) {
+            headerContentSizePx(wrapper, icon)
+        } else {
+            when {
+                icon.width > 0 -> icon.width
+                lastHeaderContentSizePx > 0 -> lastHeaderContentSizePx
+                else -> (icon.resources.displayMetrics.density * FALLBACK_CONTENT_SIZE_DP).toInt()
+            }
+        }
+        if (size <= 0) return@runCatching null
+        val summary = HostAvatarPresence.isGroupSummary(sbn)
+        snapshot.resolver.composeHostAvatarPreview(
+            context = icon.context,
+            sbn = sbn,
+            contentSizePx = size,
+            allowGroupSummaryAvatar = summary,
+        )?.also { lastHeaderContentSizePx = size }
+    }.getOrNull()
 
     private inner class HeaderPlaceholderGuard(
         private val icon: ImageView,
