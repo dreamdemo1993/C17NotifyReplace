@@ -1675,7 +1675,11 @@ internal class NotificationPanelHooks(
                     // guard stays as the cold-start net: it resolves the themed icon lazily and
                     // forces redraws until the engine is warm, then takes the slot from the
                     // app-icon placeholder the host painted in the meantime.
-                    guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot)
+                    //
+                    // [canRenderAvatar] is a *prediction*; when it says "photo" the guard installs
+                    // late instead of not at all, so a host that never paints the photo cannot
+                    // leave the row on its raw icon.
+                    guardHeaderIfHostSkipsAvatar(icon, row, sbn, snapshot)
                 }
                 // An aggregated row that just yielded still has to end up with *something*: when
                 // the host has no photo to compose it paints its own monochrome artwork, and for
@@ -2068,9 +2072,15 @@ internal class NotificationPanelHooks(
         plan: NotificationIconResolver.PanelIconRenderPlan? = null,
         /** What the host had painted before the themed write; its repaint is this again. */
         hostArtwork: Drawable? = null,
+        /**
+         * Skip the "the host will paint a photo here" prediction. Only the caller that has already
+         * looked at the slot and found the raw icon in it may pass `true`: there the prediction is
+         * known to be wrong, and honouring it would leave the row unguarded for good.
+         */
+        force: Boolean = false,
     ) {
         val context = icon.context
-        if (HostAvatarPresence.evaluate(context, sbn).renderable) return
+        if (!force && HostAvatarPresence.evaluate(context, sbn).renderable) return
         // No themed lookup here on purpose: the engine is cold, that is why this path is running
         // at all. The guard resolves the themed icon lazily on each draw instead.
         headerPlaceholderGuards
@@ -2078,6 +2088,103 @@ internal class NotificationPanelHooks(
             ?.stop()
         headerPlaceholderGuards[icon]?.start()
     }
+
+    /**
+     * Arms the themed-icon guard after actually looking at the slot, instead of trusting the
+     * prediction that the host will paint a contact photo there.
+     *
+     * The prediction ([HostAvatarPresence.canRenderAvatar]) reads the notification — a large icon
+     * that is not the launcher icon, a `Person`, a messaging style — and concludes the host has a
+     * photo to compose. ColorOS does not always follow through: WeChat's rows in the shade stayed
+     * on the plain green `smallIcon` for the whole session while every log line said `contact-photo`,
+     * because the module had yielded *and* skipped installing a guard (the first statement of
+     * [guardHeaderIconAgainstHostPlaceholder] returns on exactly that verdict). Nothing was
+     * watching the slot, so nothing could repair it — the report "微信的图标没有被替换".
+     *
+     * The host composes its avatar asynchronously (a coroutine on `Dispatchers.Default`), so
+     * judging straight away would fight the composition and make every avatar row flash the theme
+     * icon first. Instead wait out [HOST_AVATAR_GRACE_MILLIS]: a slot that is still the raw
+     * `smallIcon` / launcher icon after that window means the photo never came, and only then is
+     * the guard armed. A slot holding anything else is a real composition and is left alone — the
+     * guard itself repeats that check on every draw, so a photo arriving later still wins.
+     */
+    private fun guardHeaderIfHostSkipsAvatar(
+        icon: ImageView,
+        row: Any?,
+        sbn: StatusBarNotification,
+        snapshot: RuntimeSnapshot,
+    ) {
+        if (!HostAvatarPresence.evaluate(icon.context, sbn).renderable) {
+            guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot)
+            return
+        }
+        HOST_AVATAR_GRACE_MILLIS.forEachIndexed { index, delay ->
+            icon.postDelayed({
+                if (!configuration.isCurrent(snapshot) || !icon.isAttachedToWindow) return@postDelayed
+                // A guard already holding this slot means an earlier pass decided the avatar never
+                // came; it re-checks on every draw, so this ladder is done.
+                if (headerPlaceholderGuards[icon] != null) return@postDelayed
+                // The row may have been re-used for another notification while we waited.
+                val currentKey = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }
+                    .getOrNull()
+                if (currentKey != null && currentKey != sbn.key) return@postDelayed
+                val current = icon.drawable ?: return@postDelayed
+                if (!looksLikeRawIcon(icon.context, sbn, current)) {
+                    diagnostics.report(
+                        level = DiagnosticLevel.Debug,
+                        event = DiagnosticEvent.HostAvatarYield,
+                        message = "角标诊断：${sbn.packageName} 头像位里已有宿主合成结果，让给宿主",
+                        attributes = mapOf(
+                            "package" to sbn.packageName,
+                            "key" to sbn.key,
+                            "pass" to index.toString(),
+                            "art" to "${current.javaClass.simpleName} " +
+                                "${current.intrinsicWidth}x${current.intrinsicHeight}",
+                        ),
+                        occurrence = OccurrencePolicy.Once("host_avatar_landed:${sbn.key}"),
+                    )
+                    return@postDelayed
+                }
+                diagnostics.report(
+                    level = DiagnosticLevel.Info,
+                    event = DiagnosticEvent.HostAvatarReplace,
+                    message = "角标诊断：${sbn.packageName} 判为有头像但宿主没画（仍是原样图标），改用主题图标",
+                    attributes = mapOf(
+                        "package" to sbn.packageName,
+                        "key" to sbn.key,
+                        "pass" to index.toString(),
+                    ),
+                    occurrence = OccurrencePolicy.Once("host_avatar_skipped:${sbn.key}"),
+                )
+                guardHeaderIconAgainstHostPlaceholder(
+                    icon = icon,
+                    row = row,
+                    sbn = sbn,
+                    snapshot = snapshot,
+                    force = true,
+                )
+            }, delay)
+        }
+    }
+
+    /**
+     * Whether the slot still holds artwork the host paints when it has no avatar to compose: the
+     * notification's `smallIcon` (the tinted brand glyph ColorOS refills `mIcon` with), the
+     * launcher icon, a blank sheet or the monochrome mask.
+     *
+     * Deliberately an allow-list of "no photo here": anything unrecognised is treated as a real
+     * composition, because painting over a contact photo is the one mistake this module must not
+     * make.
+     */
+    private fun looksLikeRawIcon(
+        context: android.content.Context,
+        sbn: StatusBarNotification,
+        drawable: Drawable,
+    ): Boolean =
+        HostAvatarPresence.looksLikeNotificationSmallIcon(context, sbn, drawable) ||
+            HostAvatarPresence.looksLikeLauncherIcon(context, sbn.packageName, drawable) ||
+            HostAvatarPresence.looksBlank(drawable) ||
+            HostAvatarPresence.looksLikeMonochromeMask(drawable)
 
     private inner class HeaderPlaceholderGuard(
         private val icon: ImageView,
@@ -2750,6 +2857,17 @@ internal class NotificationPanelHooks(
          * window `CachingIconView` and the avatar coroutine were observed to land in.
          */
         const val MAX_ICON_VERIFY_PASSES = 4
+
+        /**
+         * How long to let ColorOS finish composing "avatar + badge" before deciding it never will.
+         *
+         * The composition runs in a coroutine on `Dispatchers.Default`; observed landings are well
+         * inside a second. Checking earlier would race it and flash the theme icon on every avatar
+         * row, which is worse than the delay this causes on rows the host skips. The later passes
+         * are only a safety net — the first one that finds the raw icon arms the guard, and the
+         * guard keeps watching for the rest of the row's life.
+         */
+        val HOST_AVATAR_GRACE_MILLIS = longArrayOf(700L, 1600L, 3000L)
 
         /**
          * When a child row joins an aggregated group. The first pass runs on the next loop so the
