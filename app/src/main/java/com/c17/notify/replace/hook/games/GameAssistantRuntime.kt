@@ -61,6 +61,10 @@ internal class GameAssistantRuntime(
             application = GameProcessApplication::current,
         )
 
+        // Must be armed before any watch() call: the interception is what keeps the themed icon on
+        // the view while Glide's cache and the host coroutines keep writing the original artwork.
+        GameIconWatchdog.install(hooks)
+
         installLauncherIconHook(classLoader, replacer)
         installEdgePanelIcons(classLoader, replacer)
         installEdgePanelCells(classLoader, replacer)
@@ -155,7 +159,7 @@ internal class GameAssistantRuntime(
      * picture — the loader is never called again for a package that was already displayed, so
      * replacing `u(String)` alone leaves the cached bitmap on screen. Binding is the moment the
      * cell reveals which package it shows, so the themed icon is written there and kept by
-     * [GameIconTakeovers] until Glide's cached result has landed.
+     * [GameIconWatchdog] intercepts Glide's cached result before it lands.
      */
     private fun installEdgePanelCells(classLoader: ClassLoader, replacer: GameIconReplacer) {
         val cell = Reflection.loadClassOrNull(EDGE_CELL, classLoader) { cause ->
@@ -181,7 +185,7 @@ internal class GameAssistantRuntime(
                 val icon = iconGetter?.invoke(chain.instanceOrNull) as? ImageView
                 val themed = packageName?.let { replacer.drawableFor(SITE_EDGE_PANEL, it) }
                 if (icon != null && themed != null) {
-                    GameIconTakeovers.take(icon, themed)
+                    GameIconWatchdog.watch(icon, themed, EDGE_CELL_WINDOW_MILLIS)
                 }
             }
             result
@@ -350,7 +354,7 @@ internal class GameAssistantRuntime(
         val badge = findMessageBadge(root)
         if (badge != null) {
             clearGlideRequest(badge, classLoader)
-            GameIconTakeovers.take(badge, themed, MESSAGE_BADGE_WINDOW_MILLIS)
+            GameIconWatchdog.watch(badge, themed, MESSAGE_BADGE_WINDOW_MILLIS)
             reportBadgeApplied(packageName, badge)
             return
         }
@@ -632,6 +636,9 @@ internal class GameAssistantRuntime(
 
         /** Glide delivers the host's bundled mark a few frames later, so the guard outlives the bind. */
         const val MESSAGE_BADGE_WINDOW_MILLIS = 10_000L
+
+        /** How long a dock cell's icon stays claimed after its bind; rebinds re-claim anyway. */
+        const val EDGE_CELL_WINDOW_MILLIS = 8_000L
 
         /** Glide's entry point: the library name, then the R8-renamed one this APK ships. */
         val GLIDE_ENTRY_POINTS = arrayOf("com.bumptech.glide.Glide", "com.bumptech.glide.a")
