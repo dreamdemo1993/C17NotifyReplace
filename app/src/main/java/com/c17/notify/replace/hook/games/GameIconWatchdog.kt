@@ -52,7 +52,7 @@ internal object GameIconWatchdog {
             val view = chain.instanceOrNull as? ImageView
             val incoming = chain.args.getOrNull(0) as? Drawable
             val expected = if (view != null) replacementFor(view, incoming) else null
-            if (expected != null && incoming != null) {
+            if (view != null && expected != null && incoming != null) {
                 traceIntercept(view, incoming)
                 val newArgs = chain.args.toTypedArray().also { it[0] = expected }
                 chain.proceed(newArgs)
