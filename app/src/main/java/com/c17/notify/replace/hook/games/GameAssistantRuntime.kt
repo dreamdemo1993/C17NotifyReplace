@@ -75,7 +75,7 @@ internal class GameAssistantRuntime(
 
         // Must be armed before any watch() call: the interception is what keeps the themed icon on
         // the view while Glide's cache and the host coroutines keep writing the original artwork.
-        GameIconWatchdog.install(hooks, diagnostics)
+        GameIconWatchdog.install(hooks, diagnostics, classLoader)
 
         installLauncherIconHook(classLoader, replacer)
         installEdgePanelIcons(classLoader, replacer)

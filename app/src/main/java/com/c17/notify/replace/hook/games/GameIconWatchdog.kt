@@ -46,15 +46,38 @@ internal object GameIconWatchdog {
 
     private lateinit var diagnostics: Diagnostics
 
-    /** Installs the one-time interception hook. Harmless if the method lookup fails: watch() then simply writes once and the host may win, as before. */
-    fun install(hooks: HookRegistrar, diagnostics: Diagnostics) {
+    /** Installs interception hooks on every path the host can use to paint an icon. */
+    fun install(hooks: HookRegistrar, diagnostics: Diagnostics, classLoader: ClassLoader) {
         if (installed) return
         this.diagnostics = diagnostics
-        val method = runCatching {
-            ImageView::class.java.getDeclaredMethod("setImageDrawable", Drawable::class.java)
-        }.getOrNull() ?: return
         installed = true
-        hooks.install(method, "games.image_view_guard") { chain ->
+
+        // Path 1: ImageView.setImageDrawable — the standard Glide target. COUIRoundImageView may
+        // override it and still call super, so this hook alone is not enough.
+        hookDrawableMethod(hooks, ImageView::class.java, "games.image_view_guard")
+
+        // Path 2: COUIRoundImageView.setImageDrawable — if COUI overrides the method and keeps its
+        // own internal drawable field for onDraw, the ImageView-level hook swaps super's argument
+        // but COUI's field still holds the original. Hooking the override itself replaces the
+        // argument before COUI's own logic ever sees it.
+        val couiClass = runCatching {
+            classLoader.loadClass("com.coui.appcompat.imageview.COUIRoundImageView")
+        }.getOrNull()
+        if (couiClass != null) {
+            hookDrawableMethod(hooks, couiClass, "games.coui_drawable_guard")
+            // Path 3: COUIRoundImageView.setImageBitmap — Glide can deliver through this method
+            // instead of setImageDrawable; if COUI overrides it without calling super, neither of
+            // the two hooks above sees the write.
+            hookBitmapMethod(hooks, couiClass, "games.coui_bitmap_guard")
+        }
+    }
+
+    /** Hooks `setImageDrawable(Drawable)` on [owner]: swaps the argument when a claim exists. */
+    private fun hookDrawableMethod(hooks: HookRegistrar, owner: Class<*>, label: String) {
+        val method = runCatching {
+            owner.getDeclaredMethod("setImageDrawable", Drawable::class.java)
+        }.getOrNull() ?: return
+        hooks.install(method, label) { chain ->
             val view = chain.instanceOrNull as? ImageView
             val incoming = chain.args.getOrNull(0) as? Drawable
             val expected = if (view != null) replacementFor(view, incoming) else null
@@ -68,7 +91,35 @@ internal object GameIconWatchdog {
         }
     }
 
-    private fun traceIntercept(view: ImageView, incoming: Drawable) {
+    /**
+     * Hooks `setImageBitmap(Bitmap)` on [owner]: if a claim exists, replaces the incoming bitmap
+     * with the claimed drawable's bitmap. This covers the case where COUI overrides setImageBitmap
+     * and never routes through setImageDrawable.
+     */
+    private fun hookBitmapMethod(hooks: HookRegistrar, owner: Class<*>, label: String) {
+        val method = runCatching {
+            owner.getDeclaredMethod("setImageBitmap", android.graphics.Bitmap::class.java)
+        }.getOrNull() ?: return
+        hooks.install(method, label) { chain ->
+            val view = chain.instanceOrNull as? ImageView
+            val incoming = chain.args.getOrNull(0) as? android.graphics.Bitmap
+            if (view != null && incoming != null) {
+                val entry = synchronized(watched) { watched[view] }
+                val claimedBitmap = (entry?.expected as? android.graphics.drawable.BitmapDrawable)?.bitmap
+                if (claimedBitmap != null && claimedBitmap !== incoming) {
+                    traceIntercept(view, null)
+                    val newArgs = chain.args.toTypedArray().also { it[0] = claimedBitmap }
+                    chain.proceed(newArgs)
+                } else {
+                    chain.proceed()
+                }
+            } else {
+                chain.proceed()
+            }
+        }
+    }
+
+    private fun traceIntercept(view: ImageView, incoming: Drawable?) {
         diagnostics.report(
             level = DiagnosticLevel.Debug,
             event = DiagnosticEvent.GameAssistantWatchdog,
@@ -76,7 +127,7 @@ internal object GameIconWatchdog {
             attributes = mapOf(
                 "stage" to "intercept",
                 "view" to view.javaClass.name,
-                "incoming" to incoming.javaClass.name,
+                "incoming" to (incoming?.javaClass?.name ?: "bitmap"),
             ),
             occurrence = OccurrencePolicy.RateLimited("games:watchdog_intercept", 2_000L),
         )
