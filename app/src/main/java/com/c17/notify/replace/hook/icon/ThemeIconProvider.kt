@@ -702,7 +702,7 @@ internal class ThemeIconProvider(
         const val UX_ICON_PACKAGE_MANAGER_EXT = "android.app.UxIconPackageManagerExt"
         const val ICON_CONTENT_RATIO = 1f
         const val OPAQUE_ALPHA_THRESHOLD = 8
-        const val CACHE_TTL_MS = 10_000L
+        const val CACHE_TTL_MS = 60_000L
 
         /** Misses are retried almost at once: the engine warms up within a frame or two. */
         const val MISS_CACHE_TTL_MS = 1_000L

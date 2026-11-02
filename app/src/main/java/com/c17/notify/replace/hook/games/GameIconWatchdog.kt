@@ -1,7 +1,6 @@
 package com.c17.notify.replace.hook.games
 
 import android.graphics.drawable.Drawable
-import android.os.SystemClock
 import android.widget.ImageView
 import com.c17.notify.replace.diagnostics.DiagnosticEvent
 import com.c17.notify.replace.diagnostics.DiagnosticLevel
@@ -32,7 +31,7 @@ import java.util.WeakHashMap
  */
 internal object GameIconWatchdog {
 
-    private class Entry(val expected: Drawable, val deadline: Long)
+    private class Entry(val expected: Drawable)
 
     private val watched = WeakHashMap<ImageView, Entry>()
 
@@ -85,8 +84,11 @@ internal object GameIconWatchdog {
 
     /**
      * Claims [icon] for [drawable]: writes it once and keeps every later host write pointing at it
-     * for [windowMillis]. Re-claiming a view replaces the previous claim instead of stacking.
+     * indefinitely. The claim lives until the view is rebound ([watch] replaces it, [release] drops
+     * it). No time window: an expiring claim let the host's next Glide write land the original
+     * artwork once the user stopped scrolling for a few seconds.
      */
+    @Suppress("UNUSED_PARAMETER")
     fun watch(icon: ImageView, drawable: Drawable, windowMillis: Long) {
         // Register first: the write below goes through the interception hook itself, and the fresh
         // entry must already be in place or a rebinding cell would briefly swap back to the old
@@ -94,7 +96,7 @@ internal object GameIconWatchdog {
         // earlier bind of this recycled view.
         synchronized(watched) {
             generationOf(icon).incrementAndGet()
-            watched[icon] = Entry(drawable, SystemClock.elapsedRealtime() + windowMillis)
+            watched[icon] = Entry(drawable)
         }
         icon.setImageDrawable(drawable)
         diagnostics.report(
@@ -136,12 +138,9 @@ internal object GameIconWatchdog {
     private fun replacementFor(icon: ImageView, incoming: Drawable?): Drawable? {
         if (incoming == null) return null
         val entry = synchronized(watched) { watched[icon] } ?: return null
-        val now = SystemClock.elapsedRealtime()
-        if (now > entry.deadline) {
-            synchronized(watched) { watched.remove(icon) }
-            return null
-        }
-        // Our own write from watch(): let it through untouched.
+        // No expiry: the claim lives until the view is rebound (watch/release replaces it).
+        // The old deadline-based window caused the icon to revert to native after a few seconds
+        // of sitting still — the host's next Glide write found no claim and landed untouched.
         return if (incoming === entry.expected) null else entry.expected
     }
 }

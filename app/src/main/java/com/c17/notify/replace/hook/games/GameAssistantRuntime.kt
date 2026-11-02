@@ -234,9 +234,10 @@ internal class GameAssistantRuntime(
                         event = DiagnosticEvent.GameAssistantCellBind,
                         message = "应用栏单元格绑定：${if (fastThemed != null) "已接管" else "后台解析中"}",
                         attributes = mapOf(
-                            "pkg" to (fastPkg ?: candidates.firstOrNull()),
-                            "themed" to (fastThemed != null).toString(),
-                            "mode" to mode,
+                        "pkg" to (fastPkg ?: "<pending>"),
+                        "themed" to (fastThemed != null).toString(),
+                        "mode" to mode,
+                        "candidates" to candidates.size.toString(),
                             "icon" to icon.javaClass.name,
                             "getter" to (iconGetter != null).toString(),
                             "model" to model?.javaClass?.name,
