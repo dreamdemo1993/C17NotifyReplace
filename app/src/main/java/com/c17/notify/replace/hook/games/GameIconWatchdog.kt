@@ -36,6 +36,13 @@ internal object GameIconWatchdog {
 
     private val watched = WeakHashMap<ImageView, Entry>()
 
+    /**
+     * Per-view bind generation. Every claim ([watch]) or drop ([release]) invalidates background
+     * resolutions started by an earlier bind of the same recycled view, so a slow resolve of the
+     * previous package can never paint its icon onto a cell now showing another one.
+     */
+    private val generations = WeakHashMap<ImageView, java.util.concurrent.atomic.AtomicInteger>()
+
     private var installed = false
 
     private lateinit var diagnostics: Diagnostics
@@ -83,8 +90,10 @@ internal object GameIconWatchdog {
     fun watch(icon: ImageView, drawable: Drawable, windowMillis: Long) {
         // Register first: the write below goes through the interception hook itself, and the fresh
         // entry must already be in place or a rebinding cell would briefly swap back to the old
-        // claim. After registration the write is a self-consistent no-op for the hook.
+        // claim. Bumping the generation also cancels any pending background resolution of an
+        // earlier bind of this recycled view.
         synchronized(watched) {
+            generationOf(icon).incrementAndGet()
             watched[icon] = Entry(drawable, SystemClock.elapsedRealtime() + windowMillis)
         }
         icon.setImageDrawable(drawable)
@@ -100,6 +109,28 @@ internal object GameIconWatchdog {
             occurrence = OccurrencePolicy.RateLimited("games:watchdog_watch", 2_000L),
         )
     }
+
+    /**
+     * Drops any claim on [icon] so host writes land untouched, and bumps the generation so a
+     * background resolution started by the previous bind can no longer claim the view. Called when
+     * a recycled cell binds to a package whose themed artwork is not cached yet.
+     */
+    fun release(icon: ImageView) {
+        synchronized(watched) {
+            generationOf(icon).incrementAndGet()
+            watched.remove(icon)
+        }
+    }
+
+    /** Marks the start of a background resolution; returns the generation token to fulfill with. */
+    fun reserve(icon: ImageView): Int = synchronized(watched) { generationOf(icon).incrementAndGet() }
+
+    /** Whether [generation] is still the latest bind generation of [icon]. */
+    fun isCurrent(icon: ImageView, generation: Int): Boolean =
+        synchronized(watched) { generations[icon]?.get() == generation }
+
+    private fun generationOf(icon: ImageView): java.util.concurrent.atomic.AtomicInteger =
+        generations.getOrPut(icon) { java.util.concurrent.atomic.AtomicInteger() }
 
     /** The drawable to write instead of [incoming], or null to let the host's write through. */
     private fun replacementFor(icon: ImageView, incoming: Drawable?): Drawable? {

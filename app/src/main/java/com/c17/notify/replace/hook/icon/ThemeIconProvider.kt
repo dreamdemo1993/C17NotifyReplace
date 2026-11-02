@@ -113,6 +113,26 @@ internal class ThemeIconProvider(
         null
     }
 
+    /**
+     * Cache-only lookup for hot paths: answers with whatever an earlier resolve stored and never
+     * touches the theme service. A null here means "not in cache", not "no themed artwork" — the
+     * caller is expected to fall back to an off-thread [resolveByPackage].
+     */
+    fun peekCached(context: Context, packageName: String): Bitmap? = try {
+        val configuration = iconConfiguration.read(context)
+        val key = CacheKey(
+            packageName = packageName,
+            userId = USER_HANDLE_ALL,
+            uiMode = configuration.uiMode,
+            themeChanged = configuration.themeChanged,
+            themeChangedFlags = configuration.themeChangedFlags,
+            uxIconConfig = configuration.uxIconConfig,
+        )
+        cachedEntry(key)?.takeIf { !it.isExpired() }?.let { (it.result as? CacheResult.Hit)?.bitmap }
+    } catch (_: Exception) {
+        null
+    }
+
     fun clearCache() {
         synchronized(cache) {
             cache.evictAll()

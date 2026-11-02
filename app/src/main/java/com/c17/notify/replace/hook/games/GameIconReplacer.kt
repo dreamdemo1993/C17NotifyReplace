@@ -56,6 +56,21 @@ internal class GameIconReplacer(
     }
 
     /**
+     * Cache-only variant of [drawableFor] for the scroll's hot path: answers only from what earlier
+     * resolves stored and is guaranteed to never issue a cross-process call. A null means "resolve
+     * it properly, off the UI thread" — nothing more.
+     */
+    fun cachedDrawableFor(packageName: String?): Drawable? {
+        val pkg = packageName?.trim().orEmpty()
+        if (pkg.isEmpty() || pkg == SELF_PACKAGE) return null
+        val context = application() ?: return null
+        val now = SystemClock.elapsedRealtime()
+        if (missUntil.get(pkg)?.let { it > now } == true) return null
+        val bitmap = themeIcons.peekCached(context, pkg) ?: return null
+        return BitmapDrawable(context.resources, bitmap).mutate()
+    }
+
+    /**
      * [ThemeIconProvider] caches hits for a long time but misses for exactly one second — the shade
      * needs that so a cold theme engine is retried quickly. A scrolling app strip calls this several
      * times per bound cell, and every cache miss there is a real cross-process call into the theme

@@ -49,6 +49,17 @@ internal class GameAssistantRuntime(
     private val messageBadgeBinds: MutableSet<java.lang.reflect.Method> =
         java.util.concurrent.ConcurrentHashMap.newKeySet<java.lang.reflect.Method>()
 
+    /**
+     * Where uncached dock packages get their themed artwork. A first resolve is a cross-process
+     * call into the theme service (22-60 ms measured) — exactly the kind of work that makes the
+     * app-icon strip stutter when it runs on the UI thread, so it lives here instead.
+     */
+    private val resolverExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "C17GamesIconResolve").apply { isDaemon = true }
+    }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     fun install(classLoader: ClassLoader) {
         // The theme icon comes from a framework-only API that Android lists as hidden; the module
         // already does the same exemption for its SystemUI runtime.
@@ -180,35 +191,62 @@ internal class GameAssistantRuntime(
         reportResolved(SITE_EDGE_PANEL_CELL, cell.name + "#" + bind.name)
         val iconGetter = Reflection.findMethod(cell, "getIcon")
         hooks.install(bind, "games.edge_panel.cell") { chain ->
-            val started = SystemClock.elapsedRealtime()
-            val result = chain.proceed()
+            val model = chain.args.getOrNull(0)
+            val icon = runCatching { iconGetter?.invoke(chain.instanceOrNull) as? ImageView }.getOrNull()
+            // Everything before proceed() is best-effort: the host bind must never see a module
+            // exception, or the cell renders nothing at all.
             runCatching {
-                val model = chain.args.getOrNull(0)
-                val packageName = packageFromModel(model, replacer)
-                val icon = iconGetter?.invoke(chain.instanceOrNull) as? ImageView
-                val themed = packageName?.let { replacer.drawableFor(SITE_EDGE_PANEL, it) }
-                if (icon != null && themed != null) {
-                    GameIconWatchdog.watch(icon, themed, EDGE_CELL_WINDOW_MILLIS)
+                if (icon != null) {
+                    val started = SystemClock.elapsedRealtime()
+                    val candidates = candidatesFromModel(model)
+                    // Fast path: the package's themed artwork is already in the process cache, so the
+                    // view is claimed *before* the host bind runs and Glide's cached original never
+                    // lands at all — no flash, no measurable cost.
+                    val fastPkg = candidates.firstOrNull { replacer.cachedDrawableFor(it) != null }
+                    val fastThemed = fastPkg?.let { replacer.cachedDrawableFor(it) }
+                    var mode = "pending"
+                    if (fastThemed != null) {
+                        mode = "fast"
+                        GameIconWatchdog.watch(icon, fastThemed, EDGE_CELL_WINDOW_MILLIS)
+                    } else {
+                        // Uncached: a real resolve costs a cross-process call (22-60 ms measured),
+                        // which on the UI thread is exactly the scroll stutter. It moves to a
+                        // background thread. The recycled view's stale claim is dropped first so the
+                        // new package's own artwork can land, and the themed icon is written the
+                        // moment the resolve returns.
+                        GameIconWatchdog.release(icon)
+                        val generation = GameIconWatchdog.reserve(icon)
+                        resolverExecutor.execute {
+                            val packageName = pickPackage(candidates, replacer)
+                            val themed = packageName?.let { replacer.drawableFor(SITE_EDGE_PANEL, it) }
+                            mainHandler.post {
+                                if (GameIconWatchdog.isCurrent(icon, generation)) {
+                                    themed?.let { GameIconWatchdog.watch(icon, it, EDGE_CELL_WINDOW_MILLIS) }
+                                }
+                            }
+                        }
+                    }
+                    // One rate-limited line per scroll burst answers, from the log alone: which
+                    // candidate won, whether the fast path claimed it or a background resolve is
+                    // running, and what the bind itself cost on the UI thread.
+                    diagnostics.report(
+                        level = DiagnosticLevel.Debug,
+                        event = DiagnosticEvent.GameAssistantCellBind,
+                        message = "应用栏单元格绑定：${if (fastThemed != null) "已接管" else "后台解析中"}",
+                        attributes = mapOf(
+                            "pkg" to (fastPkg ?: candidates.firstOrNull()),
+                            "themed" to (fastThemed != null).toString(),
+                            "mode" to mode,
+                            "icon" to icon.javaClass.name,
+                            "getter" to (iconGetter != null).toString(),
+                            "model" to model?.javaClass?.name,
+                            "tookMs" to (SystemClock.elapsedRealtime() - started).toString(),
+                        ),
+                        occurrence = OccurrencePolicy.RateLimited("games:cell_bind", 500L),
+                    )
                 }
-                // One rate-limited line per scroll burst answers, from the log alone: was the
-                // package read, did the theme resolve, was there an icon view to claim, and how
-                // long the whole thing took on the UI thread.
-                diagnostics.report(
-                    level = DiagnosticLevel.Debug,
-                    event = DiagnosticEvent.GameAssistantCellBind,
-                    message = "应用栏单元格绑定：${if (themed != null) "已接管" else "未接管"}",
-                    attributes = mapOf(
-                        "pkg" to packageName,
-                        "themed" to (themed != null).toString(),
-                        "icon" to icon?.javaClass?.name,
-                        "getter" to (iconGetter != null).toString(),
-                        "model" to model?.javaClass?.name,
-                        "tookMs" to (SystemClock.elapsedRealtime() - started).toString(),
-                    ),
-                    occurrence = OccurrencePolicy.RateLimited("games:cell_bind", 500L),
-                )
             }
-            result
+            chain.proceed()
         }
     }
 
@@ -558,10 +596,11 @@ internal class GameAssistantRuntime(
     /**
      * The dock cell's model carries a `business.gamedock.state.a` whose `m` is the package name.
      * Both the accessors and the field names are re-obfuscated every release, so the candidates are
-     * collected from the model's shape and the first one the theme engine actually knows wins.
+     * collected from the model's shape. Pure reflection over per-class cached fields — safe to run
+     * on the UI thread for every bound cell.
      */
-    private fun packageFromModel(model: Any?, replacer: GameIconReplacer): String? {
-        val data = model ?: return null
+    private fun candidatesFromModel(model: Any?): LinkedHashSet<String> {
+        val data = model ?: return LinkedHashSet()
         val shape = modelShape(data.javaClass)
         val candidates = LinkedHashSet<String>()
         // 10.42.6 shape: model.r().B(). On 10.43.7 the getter is gone, and asking for it throws —
@@ -585,11 +624,18 @@ internal class GameAssistantRuntime(
             val value = field.readOrNull(data) as? String ?: continue
             if (PACKAGE_SHAPE.matches(value)) candidates.add(value)
         }
+        return candidates
+    }
+
+    /**
+     * Picks the real package out of [candidates]. Dock models also carry the launch activity class
+     * name (com.foo.bar.MainActivity); probing one of those is a guaranteed PackageManager miss —
+     * an IPC every time the 10s miss cache expires. Real package names are lowercase; anything
+     * with an uppercase letter is a class name and is only kept as a last-resort fallback, never
+     * probed. Runs on the background resolver, never on the UI thread.
+     */
+    private fun pickPackage(candidates: Set<String>, replacer: GameIconReplacer): String? {
         if (candidates.isEmpty()) return null
-        // Dock models also carry the launch activity class name (com.foo.bar.MainActivity). Probing
-        // one of those is a guaranteed PackageManager miss — an IPC on the UI thread every time the
-        // 10s miss cache expires. Real package names are lowercase; anything with an uppercase
-        // letter is a class name and is only kept as a last-resort fallback, never probed.
         val probeable = candidates.filter { candidate -> candidate.none(Char::isUpperCase) }
         return (probeable.firstOrNull { replacer.hasThemeIcon(it) }
             ?: probeable.firstOrNull()
