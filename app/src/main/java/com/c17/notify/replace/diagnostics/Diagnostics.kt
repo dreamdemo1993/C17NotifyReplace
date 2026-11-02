@@ -32,6 +32,8 @@ internal enum class DiagnosticEvent(val id: String) {
     GameAssistantIconSkipped("games.icon_skipped"),
     GameAssistantIconSelfCheck("games.icon_selfcheck"),
     GameAssistantHookResolved("games.hook_resolved"),
+    GameAssistantCellBind("games.cell_bind"),
+    GameAssistantWatchdog("games.watchdog"),
     ConfigLoaded("config.loaded"),
     ConfigLoadFailed("config.load_failed"),
     ConfigPublished("config.published"),

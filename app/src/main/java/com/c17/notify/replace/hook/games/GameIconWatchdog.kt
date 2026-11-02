@@ -3,6 +3,10 @@ package com.c17.notify.replace.hook.games
 import android.graphics.drawable.Drawable
 import android.os.SystemClock
 import android.widget.ImageView
+import com.c17.notify.replace.diagnostics.DiagnosticEvent
+import com.c17.notify.replace.diagnostics.DiagnosticLevel
+import com.c17.notify.replace.diagnostics.Diagnostics
+import com.c17.notify.replace.diagnostics.OccurrencePolicy
 import com.c17.notify.replace.hook.HookRegistrar
 import java.util.WeakHashMap
 
@@ -34,9 +38,12 @@ internal object GameIconWatchdog {
 
     private var installed = false
 
+    private lateinit var diagnostics: Diagnostics
+
     /** Installs the one-time interception hook. Harmless if the method lookup fails: watch() then simply writes once and the host may win, as before. */
-    fun install(hooks: HookRegistrar) {
+    fun install(hooks: HookRegistrar, diagnostics: Diagnostics) {
         if (installed) return
+        this.diagnostics = diagnostics
         val method = runCatching {
             ImageView::class.java.getDeclaredMethod("setImageDrawable", Drawable::class.java)
         }.getOrNull() ?: return
@@ -46,12 +53,27 @@ internal object GameIconWatchdog {
             val incoming = chain.args.getOrNull(0) as? Drawable
             val expected = if (view != null) replacementFor(view, incoming) else null
             if (expected != null && incoming != null) {
+                traceIntercept(view, incoming)
                 val newArgs = chain.args.toTypedArray().also { it[0] = expected }
                 chain.proceed(newArgs)
             } else {
                 chain.proceed()
             }
         }
+    }
+
+    private fun traceIntercept(view: ImageView, incoming: Drawable) {
+        diagnostics.report(
+            level = DiagnosticLevel.Debug,
+            event = DiagnosticEvent.GameAssistantWatchdog,
+            message = "图标看门狗：拦下宿主写入，换回主题图标",
+            attributes = mapOf(
+                "stage" to "intercept",
+                "view" to view.javaClass.name,
+                "incoming" to incoming.javaClass.name,
+            ),
+            occurrence = OccurrencePolicy.RateLimited("games:watchdog_intercept", 2_000L),
+        )
     }
 
     /**
@@ -66,6 +88,17 @@ internal object GameIconWatchdog {
             watched[icon] = Entry(drawable, SystemClock.elapsedRealtime() + windowMillis)
         }
         icon.setImageDrawable(drawable)
+        diagnostics.report(
+            level = DiagnosticLevel.Debug,
+            event = DiagnosticEvent.GameAssistantWatchdog,
+            message = "图标看门狗：绑定后接管图标视图",
+            attributes = mapOf(
+                "stage" to "watch",
+                "view" to icon.javaClass.name,
+                "drawable" to drawable.javaClass.name,
+            ),
+            occurrence = OccurrencePolicy.RateLimited("games:watchdog_watch", 2_000L),
+        )
     }
 
     /** The drawable to write instead of [incoming], or null to let the host's write through. */

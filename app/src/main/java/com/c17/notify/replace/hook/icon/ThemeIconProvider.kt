@@ -296,19 +296,39 @@ internal class ThemeIconProvider(
         applicationInfo: ApplicationInfo,
     ): Drawable? {
         val uxApi = uxIconApiOrNull() ?: return null
-        val uxIconManager = try {
-            uxApi.constructor.newInstance(context.packageManager, context)
-        } catch (exception: Exception) {
-            diagnostics.runtimeFailure(
-                scope = "theme_icon:api_instance",
-                message = "创建 Oplus 主题图标管理器失败",
-                cause = exception,
-            )
-            return null
-        }
+        val uxIconManager = cachedManager(context, uxApi) ?: return null
 
         return uxApi.loadItemIcon?.invokeDrawable(uxIconManager, itemInfo, applicationInfo)
             ?: uxApi.loadItemIconWithoutEdit?.invokeDrawable(uxIconManager, itemInfo, applicationInfo)
+    }
+
+    /**
+     * One manager per process: the constructor is not free (it wires up its own binder plumbing),
+     * and the blank-sheet retry asks twice per cache miss — building a fresh instance for each
+     * answer shows up on the UI thread while a list is being flung. The manager is a thin wrapper;
+     * its binder calls re-resolve per invocation, so a cached instance answers theme switches just
+     * as well. A failed construction is not cached.
+     */
+    @Volatile
+    private var cachedManagerHolder: Any? = null
+
+    private fun cachedManager(context: Context, uxApi: UxIconApi): Any? {
+        cachedManagerHolder?.let { return it }
+        synchronized(this) {
+            cachedManagerHolder?.let { return it }
+            val instance = try {
+                uxApi.constructor.newInstance(context.packageManager, context)
+            } catch (exception: Exception) {
+                diagnostics.runtimeFailure(
+                    scope = "theme_icon:api_instance",
+                    message = "创建 Oplus 主题图标管理器失败",
+                    cause = exception,
+                )
+                return null
+            }
+            cachedManagerHolder = instance
+            return instance
+        }
     }
 
     /**

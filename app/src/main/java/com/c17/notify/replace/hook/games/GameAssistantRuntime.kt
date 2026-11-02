@@ -8,6 +8,7 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.Icon
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.widget.ImageView
 import com.c17.notify.replace.diagnostics.DiagnosticEvent
@@ -63,7 +64,7 @@ internal class GameAssistantRuntime(
 
         // Must be armed before any watch() call: the interception is what keeps the themed icon on
         // the view while Glide's cache and the host coroutines keep writing the original artwork.
-        GameIconWatchdog.install(hooks)
+        GameIconWatchdog.install(hooks, diagnostics)
 
         installLauncherIconHook(classLoader, replacer)
         installEdgePanelIcons(classLoader, replacer)
@@ -179,14 +180,33 @@ internal class GameAssistantRuntime(
         reportResolved(SITE_EDGE_PANEL_CELL, cell.name + "#" + bind.name)
         val iconGetter = Reflection.findMethod(cell, "getIcon")
         hooks.install(bind, "games.edge_panel.cell") { chain ->
+            val started = SystemClock.elapsedRealtime()
             val result = chain.proceed()
             runCatching {
-                val packageName = packageFromModel(chain.args.getOrNull(0), replacer)
+                val model = chain.args.getOrNull(0)
+                val packageName = packageFromModel(model, replacer)
                 val icon = iconGetter?.invoke(chain.instanceOrNull) as? ImageView
                 val themed = packageName?.let { replacer.drawableFor(SITE_EDGE_PANEL, it) }
                 if (icon != null && themed != null) {
                     GameIconWatchdog.watch(icon, themed, EDGE_CELL_WINDOW_MILLIS)
                 }
+                // One rate-limited line per scroll burst answers, from the log alone: was the
+                // package read, did the theme resolve, was there an icon view to claim, and how
+                // long the whole thing took on the UI thread.
+                diagnostics.report(
+                    level = DiagnosticLevel.Debug,
+                    event = DiagnosticEvent.GameAssistantCellBind,
+                    message = "应用栏单元格绑定：${if (themed != null) "已接管" else "未接管"}",
+                    attributes = mapOf(
+                        "pkg" to packageName,
+                        "themed" to (themed != null).toString(),
+                        "icon" to icon?.javaClass?.name,
+                        "getter" to (iconGetter != null).toString(),
+                        "model" to model?.javaClass?.name,
+                        "tookMs" to (SystemClock.elapsedRealtime() - started).toString(),
+                    ),
+                    occurrence = OccurrencePolicy.RateLimited("games:cell_bind", 500L),
+                )
             }
             result
         }
@@ -566,7 +586,14 @@ internal class GameAssistantRuntime(
             if (PACKAGE_SHAPE.matches(value)) candidates.add(value)
         }
         if (candidates.isEmpty()) return null
-        return candidates.firstOrNull { replacer.hasThemeIcon(it) } ?: candidates.first()
+        // Dock models also carry the launch activity class name (com.foo.bar.MainActivity). Probing
+        // one of those is a guaranteed PackageManager miss — an IPC on the UI thread every time the
+        // 10s miss cache expires. Real package names are lowercase; anything with an uppercase
+        // letter is a class name and is only kept as a last-resort fallback, never probed.
+        val probeable = candidates.filter { candidate -> candidate.none(Char::isUpperCase) }
+        return (probeable.firstOrNull { replacer.hasThemeIcon(it) }
+            ?: probeable.firstOrNull()
+            ?: candidates.firstOrNull())
     }
 
     /** Reflected shape of a dock model, built once per class instead of once per bound cell. */
