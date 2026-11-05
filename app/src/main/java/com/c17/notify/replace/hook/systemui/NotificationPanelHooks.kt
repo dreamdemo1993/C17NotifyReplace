@@ -340,6 +340,7 @@ internal class NotificationPanelHooks(
     private fun rowNeedsDrawPass(row: View, rowWrapper: Method): Boolean = runCatching {
         val wrapper = rowWrapper.invoke(row) ?: return@runCatching true
         if (wrapper.iconTarget != PanelIconTarget.Header) return@runCatching false
+        if (!wrapper.supportsHeaderIcon()) return@runCatching false
         val icon = members.headerGetIcon?.invoke(wrapper) as? ImageView ?: return@runCatching true
         val shown = icon.drawable ?: return@runCatching true
         val sbn = statusBarNotificationFromRow(row) ?: return@runCatching true
@@ -438,13 +439,18 @@ internal class NotificationPanelHooks(
         // The collapsed summary has its own hooks (initIcon / flushIcon) which already hold a
         // long-lived guard for it; running this pass on top would stack a second one per regroup.
         if (wrapper.iconTarget != PanelIconTarget.Header) return false
+        // A custom-view row has no header icon; invoking the header Method on it throws and that
+        // exception escapes into onLayout. Same check the caller used, repeated because this is the
+        // last unprotected invoke on the draw/layout path.
+        if (!wrapper.supportsHeaderIcon()) return false
         applyPanelIcon(
             wrapper = wrapper,
             rowCandidate = row,
             target = PanelIconTarget.Header,
             skipIfAlreadyApplied = true,
         )
-        val icon = members.headerGetIcon?.invoke(wrapper) as? ImageView ?: return false
+        val icon = runCatching { members.headerGetIcon?.invoke(wrapper) as? ImageView }
+            .getOrNull() ?: return false
         val shown = icon.drawable ?: return false
         val key = statusBarNotificationFromRow(row)?.key ?: return false
         return headerIconClaims.isCurrentClaim(icon, key, shown)
@@ -1438,7 +1444,10 @@ internal class NotificationPanelHooks(
                 )
                 null
             } ?: return@install chain.proceed()
-            val icon = getIcon.invoke(wrapper) as? ImageView ?: return@install chain.proceed()
+            // Throws when the wrapper is not a header wrapper (custom RemoteViews); that must never
+            // escape into the host's updateIconColor.
+            val icon = runCatching { getIcon.invoke(wrapper) as? ImageView }.getOrNull()
+                ?: return@install chain.proceed()
             val iconIdentifier = try {
                 val row = members.notificationViewWrapperRow.get(wrapper)
                 val sbn = row?.let(::statusBarNotificationFromRow)
@@ -1539,6 +1548,12 @@ internal class NotificationPanelHooks(
         val snapshot = expectedSnapshot ?: configuration.snapshot
         if (expectedSnapshot != null && !configuration.isCurrent(snapshot)) return
         if (!snapshot.config.panelIconReplacementEnabled) return
+        // Custom-view notifications have no header icon at all. Bailing out here keeps the failure
+        // out of the log (it used to be reported as an "injection failed" error on every layout)
+        // and off the layout path. Collapsed-group summaries are exempt: they look their icon up
+        // through the same Method but fall back to the row's own container, and that lookup runs
+        // inside the try below.
+        if (target == PanelIconTarget.Header && !wrapper.supportsHeaderIcon()) return
         try {
             val row = rowCandidate
                 ?: runCatching { members.notificationViewWrapperRow.get(wrapper) }.getOrNull()
@@ -2055,12 +2070,12 @@ internal class NotificationPanelHooks(
      * [guardHeaderIconAgainstHostPlaceholder] returns on exactly that verdict). Nothing was
      * watching the slot, so nothing could repair it — the report "微信的图标没有被替换".
      *
-     * The host composes its avatar asynchronously (a coroutine on `Dispatchers.Default`), so
-     * judging straight away would fight the composition and make every avatar row flash the theme
-     * icon first. Instead wait out [HOST_AVATAR_GRACE_MILLIS]: a slot that is still the raw
-     * `smallIcon` / launcher icon after that window means the photo never came, and only then is
-     * the guard armed. A slot holding anything else is a real composition and is left alone — the
-     * guard itself repeats that check on every draw, so a photo arriving later still wins.
+     * The host composes its avatar asynchronously (a coroutine on `Dispatchers.Default`), and it
+     * repaints the slot with the bare glyph between compositions, so "the slot holds the raw icon"
+     * is only meaningful when the host has *never* produced a composition for this row. The ladder
+     * in [HOST_AVATAR_GRACE_MILLIS] therefore does three things in order: remember every composition
+     * it sees, restore that composition when the host repaints over it, and only arm the themed-icon
+     * guard when ten seconds pass without a single composition.
      */
     private fun guardHeaderIfHostSkipsAvatar(
         icon: ImageView,
@@ -2074,6 +2089,16 @@ internal class NotificationPanelHooks(
             guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot)
             return
         }
+        // What the host managed to compose for this row during the window. ColorOS repaints the
+        // slot with the bare glyph between its own compositions (a rebind, a regroup, a sibling
+        // arriving), so one bare-glyph sample proves nothing: a sample taken 2.4s after the last
+        // composition is a repaint, not "the host cannot compose here".
+        //
+        // On 2026-11-05 (right after a reboot) every first WeChat message hit exactly that: the
+        // breakpoint log shows pass 0 yielding on `DrawableWithBadge 200x200` and pass 2 — three
+        // seconds later — deciding "宿主没画" and forcing the theme icon, so the row that *had* a
+        // photo was left with no avatar at all.
+        var hostArtwork: Drawable? = null
         HOST_AVATAR_GRACE_MILLIS.forEachIndexed { index, delay ->
             icon.postDelayed({
                 if (!configuration.isCurrent(snapshot) || !icon.isAttachedToWindow) return@postDelayed
@@ -2086,6 +2111,7 @@ internal class NotificationPanelHooks(
                 if (currentKey != null && currentKey != sbn.key) return@postDelayed
                 val current = icon.drawable ?: return@postDelayed
                 if (!looksLikeRawIcon(icon.context, sbn, current)) {
+                    hostArtwork = current
                     diagnostics.report(
                         level = DiagnosticLevel.Debug,
                         event = DiagnosticEvent.HostAvatarYield,
@@ -2101,6 +2127,32 @@ internal class NotificationPanelHooks(
                     )
                     return@postDelayed
                 }
+                // The host already proved it composes an avatar for this row, and this sample is
+                // one of its own repaints. Put that composition back instead of demoting the row to
+                // the theme icon: the picture is still correct, only the write order slipped.
+                val landed = hostArtwork
+                if (landed != null) {
+                    icon.clearColorFilter()
+                    icon.imageTintList = null
+                    icon.setImageDrawable(landed)
+                    diagnostics.report(
+                        level = DiagnosticLevel.Info,
+                        event = DiagnosticEvent.HostAvatarReplace,
+                        message = "角标诊断：${sbn.packageName} 宿主重绘回原样图标，" +
+                            "恢复它刚合成的头像",
+                        attributes = mapOf(
+                            "package" to sbn.packageName,
+                            "key" to sbn.key,
+                            "pass" to index.toString(),
+                        ),
+                        occurrence = OccurrencePolicy.Once("host_avatar_restored:${sbn.key}"),
+                    )
+                    return@postDelayed
+                }
+                // Give the host the first sample to itself. On a cold start it is still starting the
+                // app's process to read the photo, and composing here would take the main thread
+                // away from the very work we are waiting for.
+                if (index == 0) return@postDelayed
                 // The slot still holds the bare glyph, but the photo may well be sitting in the
                 // notification while the host's composition lost the race (or its cache still
                 // holds a placeholder-era result). Compose that avatar here instead of dropping to
@@ -2132,7 +2184,7 @@ internal class NotificationPanelHooks(
                 // the bare glyph. Giving up here pins the theme icon for good — the force-installed
                 // guard makes every later pass return at the `guards[icon] != null` check — so a
                 // notification that carries avatar material simply waits for the next pass. Only
-                // the last pass may fall back, and by then the warm-up ladder has had ~3s.
+                // the last pass may fall back, and by then the ladder has had ten seconds.
                 if (index < HOST_AVATAR_GRACE_MILLIS.lastIndex && HostAvatarPresence.contains(sbn)) {
                     return@postDelayed
                 }
@@ -2819,6 +2871,24 @@ internal class NotificationPanelHooks(
             PanelIconTarget.Header
         }
 
+    /**
+     * Whether this row wrapper actually declares the header icon.
+     *
+     * `row.getRowWrapper()` returns whichever wrapper the entry picked, and a notification with a
+     * custom `RemoteViews` gets a `NotificationCustomViewWrapper` — no header, no `mIcon`.
+     * [members.headerGetIcon] is a `Method` declared on `NotificationHeaderViewWrapper`, so invoking
+     * it on anything else throws `IllegalArgumentException: Expected receiver of type ...`
+     * ("got NotificationCustomViewWrapper"). On 2026-11-05 that exception ran up through
+     * `NotificationStackScrollLayout.onLayout` and took SystemUI down in a restart loop (four new
+     * pids in sixteen seconds). Every call site that asks a wrapper for its header icon must check
+     * this first. When the method itself could not be resolved nothing is blocked, so an unknown
+     * build keeps the old behaviour.
+     */
+    private fun Any.supportsHeaderIcon(): Boolean {
+        val method = members.headerGetIcon ?: return true
+        return method.declaringClass.isInstance(this)
+    }
+
     private fun View.findOplusGroupSummaryIcon(): ImageView? {
         val headerId = systemUiId("oplus_notification_collapsed_group_header")
         val containerId = systemUiId("icon_container")
@@ -2891,13 +2961,19 @@ internal class NotificationPanelHooks(
         /**
          * How long to let ColorOS finish composing "avatar + badge" before deciding it never will.
          *
-         * The composition runs in a coroutine on `Dispatchers.Default`; observed landings are well
-         * inside a second. Checking earlier would race it and flash the theme icon on every avatar
-         * row, which is worse than the delay this causes on rows the host skips. The later passes
-         * are only a safety net — the first one that finds the raw icon arms the guard, and the
-         * guard keeps watching for the rest of the row's life.
+         * The composition runs in a coroutine on `Dispatchers.Default`; on a warm SystemUI the
+         * landings are well inside a second, so checking earlier would race it and flash the theme
+         * icon on every avatar row. A cold SystemUI is a different story: the first message after a
+         * reboot has to start the app's process (or read its contacts cache), and the host repaints
+         * the slot with the bare glyph in between. Three seconds was not enough — the passes ran out
+         * while the row was between two of the host's own compositions, and the fallback pinned the
+         * theme icon on a notification that did have a photo.
+         *
+         * Five passes over ten seconds: the early ones only observe (and remember whatever the host
+         * composed), the later ones retry the local composition, and the very last one is the only
+         * place allowed to give up.
          */
-        val HOST_AVATAR_GRACE_MILLIS = longArrayOf(700L, 1600L, 3000L)
+        val HOST_AVATAR_GRACE_MILLIS = longArrayOf(700L, 1600L, 3000L, 6000L, 10_000L)
 
         /**
          * When a child row joins an aggregated group. The first pass runs on the next loop so the
