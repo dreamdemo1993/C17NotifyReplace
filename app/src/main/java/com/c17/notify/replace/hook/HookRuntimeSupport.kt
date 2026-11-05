@@ -119,7 +119,7 @@ internal fun Diagnostics.runtimeFailure(
 internal fun Diagnostics.installationFailure(
     scope: String,
     message: String,
-    cause: Exception,
+    cause: Throwable,
 ) {
     report(
         level = DiagnosticLevel.Error,

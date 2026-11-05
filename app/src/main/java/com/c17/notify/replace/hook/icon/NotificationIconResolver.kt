@@ -302,7 +302,7 @@ internal class NotificationIconResolver(
         null
     }
 
-    private fun IconReplacement.reportReplacementFailure(feature: String, exception: Exception) {
+    private fun IconReplacement.reportReplacementFailure(feature: String, exception: Throwable) {
         diagnostics.runtimeFailure(
             scope = "icon_resolver:$feature:replacement:$diagnosticName",
             message = "候选图标无法解码或构造，跳过该候选",
