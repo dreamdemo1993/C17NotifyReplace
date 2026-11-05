@@ -41,6 +41,14 @@ internal object HostAvatarPresence {
         val renderable: Boolean,
         val reason: String,
         val difference: Double = -1.0,
+        /**
+         * "No avatar" is only a *guess* here, taken from artwork that looks like the app's own
+         * icon or from an icon that would not decode. Both are exactly what a cold-started app
+         * ships before the sender photo exists, and the host may still paint a real photo for the
+         * row from its own store. Callers must therefore watch the slot for a moment before
+         * demoting the row to the themed icon — see the probe ladder in the panel hooks.
+         */
+        val provisional: Boolean = false,
     )
 
     fun contains(sbn: StatusBarNotification?): Boolean {
@@ -124,6 +132,9 @@ internal object HostAvatarPresence {
         if (summary && !allowGroupSummaryAvatar) return Verdict(renderable = false, reason = REASON_GROUP_SUMMARY)
         val notification = sbn.notification ?: return Verdict(renderable = true, reason = "no-notification")
         val extras = notification.extras
+        // An ongoing / foreground-service row has no sender photo to lose, so "no avatar" is the
+        // final answer there and must not be softened into a provisional one.
+        val avatarLess = (notification.flags and AVATAR_LESS_FLAGS) != 0
         if (!summary) {
             if (hasPeople(extras)) return Verdict(renderable = true, reason = "person")
             if (isMessaging(extras)) return Verdict(renderable = true, reason = "messaging-style")
@@ -148,10 +159,17 @@ internal object HostAvatarPresence {
             ?: return if (summary) {
                 Verdict(renderable = false, reason = REASON_GROUP_SUMMARY)
             } else {
-                Verdict(renderable = false, reason = REASON_NO_LARGE_ICON)
+                // Provisional: ColorOS can still compose a photo for this row from its own contact
+                // store even when the notification carries none of its own — that is exactly the
+                // first WeChat message after a reboot. The panel asks the slot before believing it.
+                Verdict(
+                    renderable = false,
+                    reason = REASON_NO_LARGE_ICON,
+                    provisional = !avatarLess,
+                )
             }
         val cacheKey = sbn.key + "#" + System.identityHashCode(largeIcon)
-        avatarDecisions.get(cacheKey)?.let { return it.forRowType(summary) }
+        avatarDecisions.get(cacheKey)?.let { return it.forRowType(summary).settled(avatarLess) }
         val verdict = runCatching { judge(context, sbn.packageName, largeIcon) }
             .getOrElse {
                 if (summary) {
@@ -161,7 +179,7 @@ internal object HostAvatarPresence {
                 }
             }
         avatarDecisions.put(cacheKey, verdict)
-        return verdict.forRowType(summary)
+        return verdict.forRowType(summary).settled(avatarLess)
     }
 
     /**
@@ -171,6 +189,10 @@ internal object HostAvatarPresence {
      */
     private fun Verdict.forRowType(summary: Boolean): Verdict =
         if (summary && !renderable) copy(reason = REASON_GROUP_SUMMARY) else this
+
+    /** Drops the "maybe" for rows that cannot have a sender photo in the first place. */
+    private fun Verdict.settled(avatarLess: Boolean): Verdict =
+        if (avatarLess && provisional) copy(provisional = false) else this
 
     /**
      * Whether a drawable the host already composed is, visually, just the app's own launcher icon.
@@ -188,12 +210,32 @@ internal object HostAvatarPresence {
         drawable: Drawable?,
     ): Boolean {
         if (context == null || packageName.isNullOrEmpty() || drawable == null) return false
-        val appIcon = runCatching {
-            context.packageManager.getApplicationIcon(packageName)
-        }.getOrNull() ?: return false
-        val difference = artworkDifference(drawable, appIcon) ?: return false
+        val pixels = sample(drawable) ?: return false
+        val reference = launcherSample(context, packageName) ?: return false
+        val difference = differenceOf(pixels, reference) ?: return false
         return difference < HOSTED_PLACEHOLDER_TOLERANCE
     }
+
+    /**
+     * Centre samples of an app's launcher icon, resolved once per package.
+     *
+     * `PackageManager.getApplicationIcon` is a binder call, and every appearance check below used
+     * to make it — the header guard asks on each draw pass, so a shade full of rows turned that
+     * into tens of milliseconds of IPC *on SystemUI's main thread*. That is the same shape as the
+     * game-assistant jank, and on a cold start it is what a watchdog kill looks like from the
+     * outside. The launcher icon is stable for the lifetime of a SystemUI process, and only the
+     * 16x16 sample is ever needed, so that is what gets cached.
+     */
+    private fun launcherSample(context: Context, packageName: String): IntArray? =
+        launcherSamples.get(packageName) ?: runCatching {
+            context.packageManager.getApplicationIcon(packageName)
+        }.getOrNull()?.let { sample(it) }?.also { launcherSamples.put(packageName, it) }
+
+    /** Same idea for the notification's own `smallIcon`, which never changes within a key. */
+    private fun smallIconSample(context: Context, sbn: StatusBarNotification): IntArray? =
+        smallIconSamples.get(sbn.key) ?: runCatching {
+            sbn.notification?.smallIcon?.loadDrawable(context)
+        }.getOrNull()?.let { sample(it) }?.also { smallIconSamples.put(sbn.key, it) }
 
     /**
      * Whether two drawables are, visually, the same picture.
@@ -231,10 +273,11 @@ internal object HostAvatarPresence {
         drawable: Drawable?,
     ): Boolean {
         if (context == null || sbn == null || drawable == null) return false
-        val smallIcon = sbn.notification?.smallIcon ?: return false
-        val loaded = runCatching { smallIcon.loadDrawable(context) }.getOrNull() ?: return false
-        artworkDifference(drawable, loaded)?.let { if (it < HOSTED_PLACEHOLDER_TOLERANCE) return true }
-        val shape = alphaDifference(drawable, loaded) ?: return false
+        if (sbn.notification?.smallIcon == null) return false
+        val pixels = sample(drawable) ?: return false
+        val reference = smallIconSample(context, sbn) ?: return false
+        differenceOf(pixels, reference)?.let { if (it < HOSTED_PLACEHOLDER_TOLERANCE) return true }
+        val shape = alphaDifferenceOf(pixels, reference) ?: return false
         return shape < HOSTED_SHAPE_TOLERANCE
     }
 
@@ -305,18 +348,29 @@ internal object HostAvatarPresence {
             return Verdict(renderable = false, reason = REASON_APP_ARTWORK)
         }
         val avatar = largeIcon.loadDrawable(context)
-            ?: return Verdict(renderable = false, reason = "large-icon-undecodable")
+            // An icon that fails to decode is not an icon that holds no photo. WeChat posts the
+            // first message of a conversation from a cold process while the sender picture is
+            // still being written, and a `content://` large icon can be unreadable for those first
+            // seconds; the host retries later and paints the photo. Answering "no avatar" here is
+            // what turned that row into a bare themed icon and kept it there.
+            ?: return Verdict(
+                renderable = true,
+                reason = REASON_UNDECODABLE,
+                provisional = true,
+            )
         // A blank canvas is not a photo. ColorOS' aggregated rows (the SMS auto-group, for one) ship
         // an all-white large icon, and composing "avatar + badge" out of it paints exactly what the
         // artwork contains: a white squircle. Treat it as "nothing to compose" so the row keeps the
-        // themed icon instead.
-        if (isBlankArtwork(avatar)) {
-            return Verdict(renderable = false, reason = REASON_BLANK_ARTWORK)
+        // themed icon instead. Sampled once and reused for the launcher comparison below.
+        val avatarPixels = sample(avatar)
+            ?: return Verdict(renderable = true, reason = "sample-failed")
+        if (isBlankPixels(avatarPixels)) {
+            // Also provisional: a flat sheet is what a cold app posts before its photo is ready.
+            return Verdict(renderable = false, reason = REASON_BLANK_ARTWORK, provisional = true)
         }
-        val appIcon = runCatching {
-            context.packageManager.getApplicationIcon(packageName)
-        }.getOrNull() ?: return Verdict(renderable = true, reason = "app-icon-unavailable")
-        val difference = artworkDifference(avatar, appIcon)
+        val appPixels = launcherSample(context, packageName)
+            ?: return Verdict(renderable = true, reason = "app-icon-unavailable")
+        val difference = differenceOf(avatarPixels, appPixels)
             ?: return Verdict(renderable = true, reason = "sample-failed")
         // The same artwork re-cropped is not always a pixel match: a bank posts its logo as a
         // square picture while the launcher icon is the same logo inside a themed squircle, so the
@@ -324,7 +378,7 @@ internal object HostAvatarPresence {
         // colour is the same brand colour" catches those without touching real photos, whose
         // palette has nothing to do with the app icon's.
         val sameBrandArtwork = difference < BRAND_PIXEL_TOLERANCE &&
-            (meanColorDelta(avatar, appIcon) ?: Double.MAX_VALUE) < BRAND_COLOR_TOLERANCE
+            (meanColorDeltaOf(avatarPixels, appPixels) ?: Double.MAX_VALUE) < BRAND_COLOR_TOLERANCE
         val placeholder = difference < PLACEHOLDER_TOLERANCE || sameBrandArtwork
         return Verdict(
             renderable = !placeholder,
@@ -334,6 +388,10 @@ internal object HostAvatarPresence {
                 else -> REASON_CONTACT_PHOTO
             },
             difference = difference,
+            // The launcher icon in the avatar slot is the classic cold-start placeholder, so the
+            // row is only *probably* avatar-less. A brand picture, on the other hand, is the app's
+            // own artwork by definition and nothing will ever turn it into a person.
+            provisional = difference < PLACEHOLDER_TOLERANCE,
         )
     }
 
@@ -351,9 +409,9 @@ internal object HostAvatarPresence {
      * is. Two renderings of one brand mark stay within a few steps of each other; a photo next to
      * a green logo does not.
      */
-    private fun meanColorDelta(left: Drawable, right: Drawable): Double? {
-        val first = meanColor(left) ?: return null
-        val second = meanColor(right) ?: return null
+    private fun meanColorDeltaOf(leftSample: IntArray, rightSample: IntArray): Double? {
+        val first = meanColorOf(leftSample) ?: return null
+        val second = meanColorOf(rightSample) ?: return null
         return (
             abs(first[0] - second[0]) +
                 abs(first[1] - second[1]) +
@@ -361,8 +419,7 @@ internal object HostAvatarPresence {
             ) / 3.0
     }
 
-    private fun meanColor(drawable: Drawable): DoubleArray? {
-        val pixels = sample(drawable) ?: return null
+    private fun meanColorOf(pixels: IntArray): DoubleArray? {
         var red = 0
         var green = 0
         var blue = 0
@@ -391,8 +448,10 @@ internal object HostAvatarPresence {
      * comparison uses, on luminance only: any real photo, even a monochrome one, varies far more
      * than the threshold across that area.
      */
-    private fun isBlankArtwork(drawable: Drawable): Boolean {
-        val pixels = sample(drawable) ?: return false
+    private fun isBlankArtwork(drawable: Drawable): Boolean =
+        sample(drawable)?.let(::isBlankPixels) ?: false
+
+    private fun isBlankPixels(pixels: IntArray): Boolean {
         var min = Double.MAX_VALUE
         var max = -Double.MAX_VALUE
         var count = 0
@@ -423,6 +482,10 @@ internal object HostAvatarPresence {
     private fun artworkDifference(left: Drawable, right: Drawable): Double? {
         val leftSample = sample(left) ?: return null
         val rightSample = sample(right) ?: return null
+        return differenceOf(leftSample, rightSample)
+    }
+
+    private fun differenceOf(leftSample: IntArray, rightSample: IntArray): Double? {
         var total = 0L
         var count = 0
         for (y in SAMPLE_MARGIN until SAMPLE_SIZE - SAMPLE_MARGIN) {
@@ -448,9 +511,7 @@ internal object HostAvatarPresence {
      * color filter, so the RGB values can be arbitrarily far apart while the shape — the only part
      * that says *which* picture this is — is identical.
      */
-    private fun alphaDifference(left: Drawable, right: Drawable): Double? {
-        val leftSample = sample(left) ?: return null
-        val rightSample = sample(right) ?: return null
+    private fun alphaDifferenceOf(leftSample: IntArray, rightSample: IntArray): Double? {
         var total = 0L
         var count = 0
         for (y in SAMPLE_MARGIN until SAMPLE_SIZE - SAMPLE_MARGIN) {
@@ -569,6 +630,15 @@ internal object HostAvatarPresence {
     /** Keyed by notification key + large-icon identity, so a re-post is re-evaluated. */
     private val avatarDecisions = LruCache<String, Verdict>(64)
 
+    /**
+     * Sampled launcher artwork per package. Never expires inside a SystemUI process: the launcher
+     * icon is fixed there, and re-reading it costs a binder call on the main thread every time.
+     */
+    private val launcherSamples = LruCache<String, IntArray>(48)
+
+    /** Sampled `smallIcon` per notification key, for the same reason. */
+    private val smallIconSamples = LruCache<String, IntArray>(48)
+
     /** [Verdict.reason] meaning the row is a collapsed group summary with no photo of its own. */
     const val REASON_GROUP_SUMMARY = "group-summary"
 
@@ -592,6 +662,12 @@ internal object HostAvatarPresence {
      * nothing to build an avatar out of and would paint the bare app icon into the avatar slot.
      */
     const val REASON_NO_LARGE_ICON = "no-large-icon"
+
+    /**
+     * [Verdict.reason] meaning the large icon exists but could not be decoded yet — a cold app
+     * whose photo is still being written. Not evidence of anything.
+     */
+    const val REASON_UNDECODABLE = "large-icon-undecodable"
 
     /** Notification categories ColorOS renders with a per-sender avatar. */
     private val AVATAR_CATEGORIES = setOf(

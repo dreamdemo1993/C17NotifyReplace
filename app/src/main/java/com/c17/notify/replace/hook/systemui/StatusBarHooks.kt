@@ -77,7 +77,7 @@ internal class StatusBarHooks(
                     )
                     true
                 }
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "status_bar:colorability",
                     message = "状态栏着色判定失败，交回 ColorOS 原实现",
@@ -133,7 +133,7 @@ internal class StatusBarHooks(
                     isColorable = plan.isColorable,
                 )
                 return@install replacement
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "status_bar:replace_icon",
                     message = "状态栏规则图标注入失败，保留 ColorOS 原结果",

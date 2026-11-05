@@ -84,7 +84,7 @@ internal class SystemUiRuntime(
                             entryMembers.notificationEntryGetSbn.invoke(it) as? StatusBarNotification
                         }
                         utilityPredicate.invoke(null, sbn?.notification) as? Boolean
-                    } catch (exception: Exception) {
+                    } catch (exception: Throwable) {
                         diagnostics.runtimeFailure(
                             scope = "systemui:use_app_icon:entry",
                             message = "读取通知当前应用图标策略失败，交回 ColorOS 缓存结果",
@@ -180,7 +180,7 @@ internal class SystemUiRuntime(
     ) {
         try {
             block()
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "config:on_published:$feature",
                 message = "配置快照已发布，但关联功能刷新失败：$feature",
@@ -193,7 +193,7 @@ internal class SystemUiRuntime(
     private inline fun installFeature(feature: String, block: () -> Unit) {
         try {
             block()
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.installationFailure(
                 scope = "systemui:feature:$feature",
                 message = "SystemUI 功能初始化失败，已独立降级：$feature",

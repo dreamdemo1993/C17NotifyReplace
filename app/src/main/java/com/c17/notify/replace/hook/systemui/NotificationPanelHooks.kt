@@ -281,7 +281,14 @@ internal class NotificationPanelHooks(
         var attempts = 0
         var lastAttemptAt = 0L
         val listener = object : ViewTreeObserver.OnPreDrawListener {
-            override fun onPreDraw(): Boolean {
+            override fun onPreDraw(): Boolean = try {
+                onRowPreDraw()
+            } catch (throwable: Throwable) {
+                reportCallbackFailure("panel:row_predraw", throwable)
+                true
+            }
+
+            private fun onRowPreDraw(): Boolean {
                 val observer = row.viewTreeObserver
                 val now = SystemClock.uptimeMillis()
                 val done = !configuration.isCurrent(snapshot) ||
@@ -292,7 +299,7 @@ internal class NotificationPanelHooks(
                     lastAttemptAt = now
                     val applied = try {
                         reapplyRowIcon(row, rowWrapper)
-                    } catch (exception: Exception) {
+                    } catch (exception: Throwable) {
                         diagnostics.runtimeFailure(
                             scope = "panel:row_first_draw",
                             message = "分组子行首次绘制时补铺图标失败",
@@ -371,7 +378,7 @@ internal class NotificationPanelHooks(
                     lastStackSweepAt = now
                     try {
                         sweepRowsForDrawPass(stack, rowClass, rowWrapper)
-                    } catch (exception: Exception) {
+                    } catch (exception: Throwable) {
                         diagnostics.runtimeFailure(
                             scope = "panel:stack_sweep",
                             message = "遍历通知列表补铺图标失败",
@@ -427,7 +434,7 @@ internal class NotificationPanelHooks(
         if (!row.isAttachedToWindow) return false
         val wrapper = try {
             rowWrapper.invoke(row)
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "panel:children_row_wrapper",
                 message = "分组子行取不到 Header wrapper，跳过图标补铺",
@@ -513,7 +520,7 @@ internal class NotificationPanelHooks(
                 occurrence = OccurrencePolicy.Once("hidden_content_replaced:$packageName"),
             )
             return true
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "panel:hidden_content_icon",
                 message = "隐藏通知内容形态图标注入失败，保留 ColorOS 原图标",
@@ -915,6 +922,27 @@ internal class NotificationPanelHooks(
                 // exists but loads late, WeChat re-posts the notification and the renderable
                 // branch above takes over from that re-bind on.
                 if (verdict.reason != HostAvatarPresence.REASON_GROUP_SUMMARY) {
+                    // A provisional verdict says "maybe no photo", not "no photo". What must not
+                    // survive it is the theme icon this module itself pinned into the host's
+                    // badge cache: the host treats a cached entry as a finished composition and
+                    // never starts its own avatar pass, so the row would keep that theme icon
+                    // even after the sender photo arrives. Drop it and let the host recompose.
+                    if (verdict.provisional && themedBadgeRows.get(rowSbn.key) != null) {
+                        evictHeaderIconBadge(resolver, chain.instanceOrNull, rawArgument)
+                        themedBadgeRows.remove(rowSbn.key)
+                        diagnostics.report(
+                            level = DiagnosticLevel.Debug,
+                            event = DiagnosticEvent.HostAvatarYield,
+                            message = "角标诊断：$packageName 头像暂不可判定（${verdict.reason}），" +
+                                "清除模块写入的角标缓存交还宿主",
+                            attributes = mapOf(
+                                "package" to packageName,
+                                "key" to rowSbn.key,
+                                "verdict" to verdict.reason,
+                            ),
+                            occurrence = OccurrencePolicy.Once("header_badge_provisional:${rowSbn.key}"),
+                        )
+                    }
                     diagnostics.report(
                         level = DiagnosticLevel.Debug,
                         event = DiagnosticEvent.HostAvatarYield,
@@ -1055,7 +1083,7 @@ internal class NotificationPanelHooks(
                 }
                 verifyGroupSummaryIconAfterWrite(iconView, row, sbn, snapshot, plan = plan)
             }
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "panel:group_attach_badge",
                 message = "聚合摘要徽标图标注入失败，保留 ColorOS 原结果",
@@ -1172,7 +1200,7 @@ internal class NotificationPanelHooks(
                     injectGroupSummaryIcon(iconView, row, snapshot, verifyAfterWrite = false)
                 }
                 verifyGroupSummaryIconAfterWrite(iconView, row, sbn, snapshot, pass + 1, plan)
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "panel:group_icon_reapply",
                     message = "重铺聚合摘要图标失败",
@@ -1216,7 +1244,7 @@ internal class NotificationPanelHooks(
                     }
                     reportGroupSummaryAnchor(iconView, null, sbn, "initIconViewColor")
                     null
-                } catch (exception: Exception) {
+                } catch (exception: Throwable) {
                     diagnostics.runtimeFailure(
                         scope = "panel:group_icon_color",
                         message = "折叠分组图标着色覆盖失败，交回 ColorOS 原实现",
@@ -1312,7 +1340,7 @@ internal class NotificationPanelHooks(
                     java.lang.Boolean.FALSE,
                 )
                 chain.proceed(chain.args.toTypedArray().also { it[1] = replacement })
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "panel:group_pill_palette",
                     message = "折叠分组上标配色对齐失败，交回 ColorOS 原实现",
@@ -1339,7 +1367,7 @@ internal class NotificationPanelHooks(
             val dark = getters.firstOrNull { it.name == "getSecond" }?.invoke(triple) as? Int
                 ?: return null
             intArrayOf(light, dark).also { cachedNeutralPillPalette = it }
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             // A missing Companion helper only costs the cold-start case; coloured rows then keep
             // the host colour until a mono row has been painted once.
             diagnostics.report(
@@ -1382,7 +1410,7 @@ internal class NotificationPanelHooks(
                     oplusHeader.getBase.invoke(extension)?.let { wrapper ->
                         applyPanelIcon(wrapper, target = wrapper.iconTarget)
                     }
-                } catch (exception: Exception) {
+                } catch (exception: Throwable) {
                     diagnostics.runtimeFailure(
                         scope = "panel:header_badge_apply",
                         message = "Oplus Header 徽标合成后恢复图标失败",
@@ -1413,7 +1441,7 @@ internal class NotificationPanelHooks(
                     oplusHeader.getBase.invoke(extension)?.let { wrapper ->
                         applyPanelIcon(wrapper)
                     }
-                } catch (exception: Exception) {
+                } catch (exception: Throwable) {
                     diagnostics.runtimeFailure(
                         scope = "panel:oplus_header_content_updated",
                         message = "Oplus Header 内容更新后恢复图标失败",
@@ -1435,7 +1463,7 @@ internal class NotificationPanelHooks(
             val extension = chain.instanceOrNull ?: return@install chain.proceed()
             val wrapper = try {
                 oplusHeader.getBase.invoke(extension)
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "panel:header_color_guard",
                     message = "Oplus Header 二次着色保护失败，交回原实现",
@@ -1457,7 +1485,7 @@ internal class NotificationPanelHooks(
                     drawable != null &&
                     headerIconClaims.isCurrentClaim(icon, sbn.key, drawable)
                 ) sbn.key else null
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "panel:header_color_guard",
                     message = "Oplus Header 二次着色保护失败，交回原实现",
@@ -1477,7 +1505,7 @@ internal class NotificationPanelHooks(
             if (iconIdentifier == null) {
                 try {
                     applyPanelIcon(wrapper)
-                } catch (exception: Exception) {
+                } catch (exception: Throwable) {
                     diagnostics.runtimeFailure(
                         scope = "panel:header_color_reapply",
                         message = "Oplus Header 二次着色后恢复图标失败",
@@ -1497,7 +1525,7 @@ internal class NotificationPanelHooks(
             val wrapper = extension?.let { instance ->
                 try {
                     oplusHeader.getBase.invoke(instance)
-                } catch (exception: Exception) {
+                } catch (exception: Throwable) {
                     diagnostics.runtimeFailure(
                         scope = "panel:header_roundness_reapply",
                         message = "Oplus Header 圆角处理前读取 wrapper 失败",
@@ -1518,7 +1546,7 @@ internal class NotificationPanelHooks(
             if (wrapper != null) {
                 try {
                     applyPanelIcon(wrapper, target = wrapper.iconTarget)
-                } catch (exception: Exception) {
+                } catch (exception: Throwable) {
                     diagnostics.runtimeFailure(
                         scope = "panel:header_roundness_reapply",
                         message = "Oplus Header 圆角处理后恢复图标失败",
@@ -1635,7 +1663,8 @@ internal class NotificationPanelHooks(
                     // (report: 「第一条消息直接变成了主题图标 没有头像」, WeChat posts the message
                     // first and the sender photo ~9s later). Once the row yields the slot belongs
                     // to the host; the ladder below re-arms a guard if the host still draws nothing.
-                    if (HostAvatarPresence.evaluate(icon.context, sbn).renderable) {
+                    val verdict = HostAvatarPresence.evaluate(icon.context, sbn)
+                    if (verdict.renderable || verdict.provisional) {
                         headerPlaceholderGuards.remove(icon)?.stop()
                     }
                     prefillHostAvatar(icon, wrapper, sbn, snapshot)
@@ -1707,7 +1736,7 @@ internal class NotificationPanelHooks(
                     guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot, plan, hostArtwork)
                 }
             }
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "panel:replace_icon:${target.diagnosticName}",
                 message = "通知面板规则图标注入失败，保留 ColorOS 原结果",
@@ -1777,7 +1806,7 @@ internal class NotificationPanelHooks(
                     )
                 }
                 verifyIconAfterWrite(icon, wrapper, row, sbn, snapshot, target, pass + 1, reapplyPlan)
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "panel:icon_reapply",
                     message = "重铺被宿主回填的图标失败",
@@ -1886,7 +1915,14 @@ internal class NotificationPanelHooks(
             reportGroupSummaryAnchor(icon, null, latestSbn, "snapshotReload")
         }
 
-        override fun onPreDraw(): Boolean {
+        override fun onPreDraw(): Boolean = try {
+            onGroupPreDraw()
+        } catch (throwable: Throwable) {
+            reportCallbackFailure("panel:group_icon_predraw", throwable)
+            true
+        }
+
+        private fun onGroupPreDraw(): Boolean {
             if (stopped) return true
             if (!icon.isAttachedToWindow) {
                 stop()
@@ -2085,9 +2121,20 @@ internal class NotificationPanelHooks(
         /** The view wrapper this icon belongs to; only used to ask the host for its content size. */
         wrapper: Any? = null,
     ) {
-        if (!HostAvatarPresence.evaluate(icon.context, sbn).renderable) {
+        val verdict = HostAvatarPresence.evaluate(icon.context, sbn)
+        if (!verdict.renderable && !verdict.provisional) {
             guardHeaderIconAgainstHostPlaceholder(icon, row, sbn, snapshot)
             return
+        }
+        // Both cases are answered by watching the slot, but they differ in how much time the host
+        // deserves. "It has a photo" is worth ten seconds: ColorOS composes asynchronously and the
+        // app may still be loading the picture. "It probably has no photo" (a launcher-icon
+        // placeholder, an undecodable icon, a missing one) is a *guess* that the slot can settle
+        // within a few seconds, and sitting on the raw app icon that long is its own complaint.
+        val ladder = if (verdict.renderable && !verdict.provisional) {
+            HOST_AVATAR_GRACE_MILLIS
+        } else {
+            PLACEHOLDER_PROBE_MILLIS
         }
         // What the host managed to compose for this row during the window. ColorOS repaints the
         // slot with the bare glyph between its own compositions (a rebind, a regroup, a sibling
@@ -2099,8 +2146,26 @@ internal class NotificationPanelHooks(
         // seconds later — deciding "宿主没画" and forcing the theme icon, so the row that *had* a
         // photo was left with no avatar at all.
         var hostArtwork: Drawable? = null
-        HOST_AVATAR_GRACE_MILLIS.forEachIndexed { index, delay ->
+        if (!verdict.renderable) {
+            diagnostics.report(
+                level = DiagnosticLevel.Debug,
+                event = DiagnosticEvent.HostAvatarYield,
+                message = "角标诊断：${sbn.packageName} 头像位判定为占位（${verdict.reason}），" +
+                    "先让宿主画几拍再决定",
+                attributes = mapOf(
+                    "package" to sbn.packageName,
+                    "key" to sbn.key,
+                    "verdict" to verdict.reason,
+                    "difference" to verdict.difference.toString(),
+                ),
+                occurrence = OccurrencePolicy.Once("host_avatar_probe:${sbn.key}"),
+            )
+        }
+        ladder.forEachIndexed { index, delay ->
             icon.postDelayed({
+                // Anything escaping this lambda lands in SystemUI's main Handler, so it gets the
+                // same net as the draw callbacks. The body keeps its own early returns.
+                try {
                 if (!configuration.isCurrent(snapshot) || !icon.isAttachedToWindow) return@postDelayed
                 // A guard already holding this slot means an earlier pass decided the avatar never
                 // came; it re-checks on every draw, so this ladder is done.
@@ -2185,7 +2250,9 @@ internal class NotificationPanelHooks(
                 // guard makes every later pass return at the `guards[icon] != null` check — so a
                 // notification that carries avatar material simply waits for the next pass. Only
                 // the last pass may fall back, and by then the ladder has had ten seconds.
-                if (index < HOST_AVATAR_GRACE_MILLIS.lastIndex && HostAvatarPresence.contains(sbn)) {
+                if (index < ladder.lastIndex &&
+                    (verdict.provisional || HostAvatarPresence.contains(sbn))
+                ) {
                     return@postDelayed
                 }
                 diagnostics.report(
@@ -2206,6 +2273,9 @@ internal class NotificationPanelHooks(
                     snapshot = snapshot,
                     force = true,
                 )
+                } catch (throwable: Throwable) {
+                    reportCallbackFailure("panel:avatar_probe", throwable)
+                }
             }, delay)
         }
     }
@@ -2262,6 +2332,26 @@ internal class NotificationPanelHooks(
             allowGroupSummaryAvatar = false,
         )?.also { lastHeaderContentSizePx = size }
     }.getOrNull()
+
+    /**
+     * Last-resort net for callbacks SystemUI invokes on its main thread.
+     *
+     * An `onPreDraw` / `onLayout` body that throws is not logged and skipped: the exception
+     * propagates into SystemUI's own traversal and kills the process, and the notification that
+     * caused it is still there after the restart — the 09:49 crash loop. `Throwable` rather than
+     * `Exception` on purpose: the artwork checks allocate bitmaps, and an `OutOfMemoryError`
+     * escaping one of these callbacks is just as fatal.
+     */
+    private fun reportCallbackFailure(scope: String, throwable: Throwable) {
+        runCatching {
+            diagnostics.runtimeFailure(
+                scope = scope,
+                message = "SystemUI 主线程回调异常已拦截，避免进程重启",
+                cause = throwable,
+                revision = configuration.snapshot.revision,
+            )
+        }
+    }
 
     private inner class HeaderPlaceholderGuard(
         private val icon: ImageView,
@@ -2359,7 +2449,14 @@ internal class NotificationPanelHooks(
             headerPlaceholderGuards[icon]?.start()
         }
 
-        override fun onPreDraw(): Boolean {
+        override fun onPreDraw(): Boolean = try {
+            onHeaderPreDraw()
+        } catch (throwable: Throwable) {
+            reportCallbackFailure("panel:header_guard_predraw", throwable)
+            true
+        }
+
+        private fun onHeaderPreDraw(): Boolean {
             if (stopped) return true
             // A detached view never draws; if this does fire while the row is between layouts just
             // wait — [onViewAttachedToWindow] re-arms the listener anyway.
@@ -2551,7 +2648,14 @@ internal class NotificationPanelHooks(
          * One identity compare per frame; the expensive artwork test only runs when the host
          * actually swapped the drawable, so scrolling the shade stays cheap.
          */
-        override fun onPreDraw(): Boolean {
+        override fun onPreDraw(): Boolean = try {
+            onSummaryPreDraw()
+        } catch (throwable: Throwable) {
+            reportCallbackFailure("panel:summary_blank_predraw", throwable)
+            true
+        }
+
+        private fun onSummaryPreDraw(): Boolean {
             if (stopped) return true
             if (!icon.isAttachedToWindow) {
                 stop()
@@ -2676,7 +2780,7 @@ internal class NotificationPanelHooks(
                     }.getOrNull()
                 },
             )
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "panel:replace_icon:${PanelIconTarget.OplusGroupSummary.diagnosticName}",
                 message = "通知面板规则图标注入失败，保留 ColorOS 原结果",
@@ -2754,7 +2858,7 @@ internal class NotificationPanelHooks(
                 ),
                 occurrence = OccurrencePolicy.Once("panel:host_avatar_prefill:${sbn.packageName}"),
             )
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "panel:host_avatar_prefill",
                 message = "头像预合成失败，保留宿主第一帧",
@@ -2974,6 +3078,20 @@ internal class NotificationPanelHooks(
          * place allowed to give up.
          */
         val HOST_AVATAR_GRACE_MILLIS = longArrayOf(700L, 1600L, 3000L, 6000L, 10_000L)
+
+        /**
+         * How long a *provisional* "no avatar" verdict may sit on the slot before the row is
+         * demoted to the themed icon.
+         *
+         * The verdict comes from artwork that looks like the app's own icon, from an icon that
+         * would not decode, or from a missing one — all three are what a cold-started app ships
+         * before the sender photo exists, and ColorOS can still paint a real photo for that row
+         * from its own store (the first WeChat message after a reboot is exactly that case, and the
+         * original report was "每个联系人的第一条消息都是主题图标，没有头像"). Unlike the ten-second
+         * ladder this one cannot linger: if the guess was right, the row is sitting on the raw app
+         * icon the whole time, which is the "why did my icon stop being themed" complaint.
+         */
+        val PLACEHOLDER_PROBE_MILLIS = longArrayOf(700L, 1600L, 3000L)
 
         /**
          * When a child row joins an aggregated group. The first pass runs on the next loop so the

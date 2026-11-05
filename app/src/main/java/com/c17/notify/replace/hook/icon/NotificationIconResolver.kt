@@ -57,7 +57,7 @@ internal class NotificationIconResolver(
         sbn: StatusBarNotification,
     ): Drawable? = try {
         themeIcons.resolve(context, sbn)?.toDrawable(context.resources)
-    } catch (exception: Exception) {
+    } catch (exception: Throwable) {
         diagnostics.runtimeFailure(
             scope = "icon_resolver:panel:theme_drawable",
             message = "桌面主题图标解码失败，保留 ColorOS 原图标",
@@ -76,7 +76,7 @@ internal class NotificationIconResolver(
         packageName: String,
     ): Drawable? = try {
         themeIcons.resolveByPackage(context, packageName)?.toDrawable(context.resources)
-    } catch (exception: Exception) {
+    } catch (exception: Throwable) {
         diagnostics.runtimeFailure(
             scope = "icon_resolver:panel:theme_drawable:pkg",
             message = "按包名解析桌面主题图标失败，保留 ColorOS 原图标",
@@ -99,7 +99,7 @@ internal class NotificationIconResolver(
         sbn: StatusBarNotification,
     ): Icon? = try {
         themeIcons.resolve(context, sbn)?.let { Icon.createWithBitmap(it) }
-    } catch (exception: Exception) {
+    } catch (exception: Throwable) {
         diagnostics.runtimeFailure(
             scope = "icon_resolver:lockscreen:theme_icon",
             message = "锁屏胶囊主题图标解码失败，交回宿主实现",
@@ -269,7 +269,7 @@ internal class NotificationIconResolver(
         feature: String,
     ): StatusBarIconRenderPlan? = try {
         toStatusBarIconRenderPlan(context)
-    } catch (exception: Exception) {
+    } catch (exception: Throwable) {
         reportReplacementFailure(feature, exception)
         null
     }
@@ -297,7 +297,7 @@ internal class NotificationIconResolver(
         feature: String,
     ): PanelIconRenderPlan? = try {
         toPanelIconRenderPlan(context)
-    } catch (exception: Exception) {
+    } catch (exception: Throwable) {
         reportReplacementFailure(feature, exception)
         null
     }
@@ -342,7 +342,7 @@ internal class NotificationIconResolver(
         block: () -> T?,
     ): T? = try {
         block()
-    } catch (exception: Exception) {
+    } catch (exception: Throwable) {
         diagnostics.runtimeFailure(
             scope = "icon_resolver:$feature",
             message = message,
@@ -397,7 +397,15 @@ internal class NotificationIconResolver(
             allowGroupSummaryAvatar = HostAvatarPresence.isGroupSummary(sbn),
         )
         val hostAvatarAvailable = verdict.renderable
-        val yield = NotificationIconPolicy.shouldYieldToHostAvatar(
+        // A "no avatar" verdict reached from the artwork is only a guess: a cold app posts the
+        // first message of a conversation before the sender photo exists, and ColorOS still
+        // paints one for that row out of its own store. Giving the slot the benefit of the doubt
+        // costs a short probe (the panel watches the row and demotes it if nothing arrives) and
+        // buys back the avatar; believing the guess costs the avatar for good.
+        val provisionalYield = !hostAvatarAvailable &&
+            verdict.provisional &&
+            NotificationIconPolicy.isAvatarPriorityPackage(policyConfig, packageName)
+        val yield = provisionalYield || NotificationIconPolicy.shouldYieldToHostAvatar(
             config = policyConfig,
             packageName = packageName,
             hostAvatarAvailable = hostAvatarAvailable,
@@ -434,6 +442,7 @@ internal class NotificationIconResolver(
                     "key" to (sbn?.key ?: ""),
                     "host_listed" to HostAvatarPackages.contains(context, packageName),
                     "verdict" to verdict.reason,
+                    "provisional" to provisionalYield.toString(),
                     "difference" to verdict.difference.toString(),
                     "summary" to HostAvatarPresence.isGroupSummary(sbn).toString(),
                 ),
@@ -469,7 +478,7 @@ internal class NotificationIconResolver(
         val badge = resolveThemeDrawableByPackage(context, sbn.packageName) ?: return null
         val avatar = try {
             HostAvatarPresence.avatarDrawable(context, sbn)
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "icon_resolver:host_avatar_prefill",
                 message = "预览头像解码失败，交给宿主异步合成",

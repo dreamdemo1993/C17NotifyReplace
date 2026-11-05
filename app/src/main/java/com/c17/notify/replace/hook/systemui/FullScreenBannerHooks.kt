@@ -198,7 +198,7 @@ internal class FullScreenBannerHooks(
         return try {
             snapshot.resolver.resolveThemeDrawableByPackage(context, sbn.packageName)
                 ?.takeIf { configuration.isCurrent(snapshot) }
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             null
         }
     }
@@ -276,7 +276,7 @@ internal class FullScreenBannerHooks(
                 sbn = sbn,
                 originalSmallIcon = sbn.originalSmallIcon(diagnostics, snapshot.revision),
             )?.takeIf { configuration.isCurrent(snapshot) }
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "fullscreen_banner:resolve",
                 message = "全屏轻反馈图标解析失败",
@@ -291,7 +291,7 @@ internal class FullScreenBannerHooks(
         if (entry == null) return null
         return try {
             members.notificationEntryGetSbn.invoke(entry) as? StatusBarNotification
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "fullscreen_banner:entry",
                 message = "读取全屏轻反馈通知 entry 失败",

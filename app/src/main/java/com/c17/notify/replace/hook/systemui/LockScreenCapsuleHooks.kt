@@ -96,7 +96,7 @@ internal class LockScreenCapsuleHooks(
                         members.notificationIconDataIconColorField?.set(iconData, null)
                     },
                 )
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "lockscreen:capsule:rounded_icon",
                     message = "锁屏胶囊圆角图标改写失败，交回 ColorOS 原实现",
@@ -211,7 +211,7 @@ internal class LockScreenCapsuleHooks(
         if (!isLockScreenIslandIconView(iconView)) return false
         val sbn = try {
             members.notificationEntryGetSbn.invoke(entry) as? StatusBarNotification
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "lockscreen:capsule:group_icon_color",
                 message = "锁屏胶囊聚合 entry 读取失败",
@@ -268,7 +268,7 @@ internal class LockScreenCapsuleHooks(
         val sbn = entry?.let {
             try {
                 members.notificationEntryGetSbn.invoke(it) as? StatusBarNotification
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "lockscreen:capsule:entry",
                     message = "读取锁屏胶囊通知 entry 失败",
@@ -382,7 +382,7 @@ internal class LockScreenCapsuleHooks(
         StatusBarIconReplacementCache.lookup(key, packageName)?.let { cached ->
             val drawable = try {
                 cached.icon.loadDrawable(context)?.mutate()
-            } catch (exception: Exception) {
+            } catch (exception: Throwable) {
                 diagnostics.runtimeFailure(
                     scope = "lockscreen:capsule:load_cached",
                     message = "锁屏胶囊缓存图标解码失败",
@@ -425,7 +425,7 @@ internal class LockScreenCapsuleHooks(
                     }
                 }
             }
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "lockscreen:capsule:resolve",
                 message = "锁屏胶囊图标解析失败",
@@ -448,7 +448,7 @@ internal class LockScreenCapsuleHooks(
         val icon = snapshot.resolver.resolveLockScreenThemeIcon(context, sbn) ?: return null
         val drawable = try {
             icon.loadDrawable(context)?.mutate()
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "lockscreen:capsule:theme_load",
                 message = "锁屏胶囊主题图标解码失败",
@@ -489,7 +489,7 @@ internal class LockScreenCapsuleHooks(
         replacementDrawables.add(drawable)
         val bitmap = try {
             drawable.toBitmap()
-        } catch (exception: Exception) {
+        } catch (exception: Throwable) {
             diagnostics.runtimeFailure(
                 scope = "lockscreen:capsule:theme_bitmap",
                 message = "锁屏胶囊主题图标位图转换失败",
