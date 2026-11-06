@@ -21,6 +21,7 @@ import com.c17.notify.replace.diagnostics.Diagnostics
 import com.c17.notify.replace.diagnostics.OccurrencePolicy
 import com.c17.notify.replace.hook.HookRegistrar
 import com.c17.notify.replace.hook.icon.HostAvatarComposition
+import com.c17.notify.replace.hook.icon.HostAvatarPackages
 import com.c17.notify.replace.hook.icon.HostAvatarPresence
 import com.c17.notify.replace.hook.icon.NotificationIconResolver
 import com.c17.notify.replace.hook.memberMissing
@@ -2131,10 +2132,16 @@ internal class NotificationPanelHooks(
         // app may still be loading the picture. "It probably has no photo" (a launcher-icon
         // placeholder, an undecodable icon, a missing one) is a *guess* that the slot can settle
         // within a few seconds, and sitting on the raw app icon that long is its own complaint.
-        val ladder = if (verdict.renderable && !verdict.provisional) {
-            HOST_AVATAR_GRACE_MILLIS
-        } else {
-            PLACEHOLDER_PROBE_MILLIS
+        //
+        // The exception is a package ColorOS itself treats as a personal-avatar sender. There the
+        // guess is usually wrong — WeChat posts many notifications without a `largeIcon` and the
+        // host composes the sender photo from its own contact store, just late. A themed icon
+        // strips both the avatar and the badge, so those rows get the full window; meanwhile they
+        // show the host's own "app icon + badge", which is a fine intermediate.
+        val ladder = when {
+            verdict.renderable && !verdict.provisional -> HOST_AVATAR_GRACE_MILLIS
+            HostAvatarPackages.contains(icon.context, sbn.packageName) -> HOST_AVATAR_GRACE_MILLIS
+            else -> PLACEHOLDER_PROBE_MILLIS
         }
         // What the host managed to compose for this row during the window. ColorOS repaints the
         // slot with the bare glyph between its own compositions (a rebind, a regroup, a sibling
@@ -2263,6 +2270,11 @@ internal class NotificationPanelHooks(
                         "package" to sbn.packageName,
                         "key" to sbn.key,
                         "pass" to index.toString(),
+                        // What the slot actually held when the ladder gave up. Naming it is what
+                        // tells a "the host never composed" row apart from a composition the
+                        // appearance checks failed to recognise.
+                        "art" to "${current.javaClass.simpleName} " +
+                            "${current.intrinsicWidth}x${current.intrinsicHeight}",
                     ),
                     occurrence = OccurrencePolicy.Once("host_avatar_skipped:${sbn.key}"),
                 )
@@ -2294,10 +2306,14 @@ internal class NotificationPanelHooks(
         sbn: StatusBarNotification,
         drawable: Drawable,
     ): Boolean =
-        HostAvatarPresence.looksLikeNotificationSmallIcon(context, sbn, drawable) ||
-            HostAvatarPresence.looksLikeLauncherIcon(context, sbn.packageName, drawable) ||
-            HostAvatarPresence.looksBlank(drawable) ||
-            HostAvatarPresence.looksLikeMonochromeMask(drawable)
+        // Checked first and on its own: the host's "avatar + badge" picture shares the centre of
+        // the artwork with the bare glyph it replaces, so every content comparison below can match
+        // it and the caller then overwrites a real avatar (see looksLikeHostComposition).
+        !HostAvatarPresence.looksLikeHostComposition(drawable) &&
+            (HostAvatarPresence.looksLikeNotificationSmallIcon(context, sbn, drawable) ||
+                HostAvatarPresence.looksLikeLauncherIcon(context, sbn.packageName, drawable) ||
+                HostAvatarPresence.looksBlank(drawable) ||
+                HostAvatarPresence.looksLikeMonochromeMask(drawable))
 
     /**
      * The "contact photo + app-icon badge" picture for [sbn], built with the host's own composer.
@@ -2544,9 +2560,10 @@ internal class NotificationPanelHooks(
          * unknown drawable, i.e. on exactly that refill).
          */
         private fun isHostPlaceholder(drawable: Drawable): Boolean =
-            isHostAppIconPlaceholder(drawable) ||
-                HostAvatarPresence.looksLikeSameArtwork(drawable, hostArtwork) ||
-                HostAvatarPresence.looksLikeNotificationSmallIcon(icon.context, sbn, drawable)
+            !HostAvatarPresence.looksLikeHostComposition(drawable) &&
+                (isHostAppIconPlaceholder(drawable) ||
+                    HostAvatarPresence.looksLikeSameArtwork(drawable, hostArtwork) ||
+                    HostAvatarPresence.looksLikeNotificationSmallIcon(icon.context, sbn, drawable))
 
         private fun isHostAppIconPlaceholder(drawable: Drawable): Boolean =
             HostAvatarPresence.looksLikeLauncherIcon(icon.context, sbn.packageName, drawable) ||

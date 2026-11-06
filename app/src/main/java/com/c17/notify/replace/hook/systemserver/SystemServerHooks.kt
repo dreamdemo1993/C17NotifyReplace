@@ -42,11 +42,11 @@ internal class SystemServerHooks(
             if (notification != null && originalIcon != null) {
                 try {
                     notification.extras.putParcelable(HookContract.EXTRA_ORIGINAL_SMALL_ICON, originalIcon)
-                } catch (exception: Exception) {
+                } catch (throwable: Throwable) {
                     diagnostics.runtimeFailure(
                         scope = "system_server:preserve_original_icon",
                         message = "缓存 ColorOS 修正前的 smallIcon 失败",
-                        cause = exception,
+                        cause = throwable,
                     )
                 }
             }

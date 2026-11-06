@@ -257,6 +257,40 @@ internal object HostAvatarPresence {
     }
 
     /**
+     * Whether [drawable] is a composition the host built itself — the round "photo + app-icon badge"
+     * picture ColorOS draws for rows that get the personal-avatar treatment.
+     *
+     * This cannot be answered by comparing pixels, and that is exactly why the panel kept eating
+     * its own result: the main picture of such a composition is often the same glyph as
+     * `Notification#smallIcon`, and the badge only covers a corner, so inside the sampled window
+     * the alpha silhouette is nearly identical. [looksLikeNotificationSmallIcon] therefore said
+     * "this is the raw icon", the probe ladder concluded "the host never composed anything" three
+     * seconds later, and the row that had just shown an avatar jumped to the themed icon
+     * (report: 原生图标 → 跳变成主题图标，不显示个人头像 + 角标).
+     *
+     * The class name is the reliable part: the host composes through
+     * `LayerDrawableWithAppIconKt.createBackgroundWithAppIcon` and the result carries it in the
+     * type. Walk the hierarchy because builds differ in how many wrapper layers they add.
+     */
+    fun looksLikeHostComposition(drawable: Drawable?): Boolean {
+        var type: Class<*>? = drawable?.javaClass
+        var depth = 0
+        while (depth < 8) {
+            val current = type ?: return false
+            val name = current.simpleName ?: ""
+            if (name.contains("Badge", ignoreCase = true) ||
+                name.contains("Avatar", ignoreCase = true) ||
+                name.contains("WithAppIcon", ignoreCase = true)
+            ) {
+                return true
+            }
+            type = current.superclass
+            depth++
+        }
+        return false
+    }
+
+    /**
      * Whether [drawable] is the notification's own `smallIcon` — the artwork ColorOS refills the
      * header slot with when it has no avatar to compose.
      *
@@ -274,6 +308,10 @@ internal object HostAvatarPresence {
     ): Boolean {
         if (context == null || sbn == null || drawable == null) return false
         if (sbn.notification?.smallIcon == null) return false
+        // A composition the host built around the avatar must never read as "the raw glyph is
+        // back": its corner badge leaves the centre silhouette almost untouched, so the alpha
+        // comparison below would happily match it and the caller would paint over a real avatar.
+        if (looksLikeHostComposition(drawable)) return false
         val pixels = sample(drawable) ?: return false
         val reference = smallIconSample(context, sbn) ?: return false
         differenceOf(pixels, reference)?.let { if (it < HOSTED_PLACEHOLDER_TOLERANCE) return true }
