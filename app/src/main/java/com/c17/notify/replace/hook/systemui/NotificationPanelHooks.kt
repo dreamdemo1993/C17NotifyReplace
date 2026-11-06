@@ -849,41 +849,10 @@ internal class NotificationPanelHooks(
                         )
                         return@install null
                     }
-                    if (hostedDrawable == null) {
-                        // The cache is still empty, i.e. the host has launched its composition
-                        // coroutine but has not finished it yet. Filling that window with the very
-                        // same picture removes the "原生图标一闪而过" the user sees on the first
-                        // frame; the host's own result lands a frame or two later and replaces it
-                        // with an identical drawable.
-                        val prefillSize = lastHeaderContentSizePx.takeIf { it > 0 }
-                            ?: snapshot.resolver.resolveThemeDrawableByPackage(context, packageName)
-                                ?.intrinsicWidth
-                                ?.takeIf { it > 0 }
-                        val prefilled = prefillSize?.let { size ->
-                            snapshot.resolver.composeHostAvatarPreview(
-                                context = context,
-                                sbn = rowSbn,
-                                contentSizePx = size,
-                                allowGroupSummaryAvatar = false,
-                            )
-                        }
-                        if (prefilled != null) {
-                            diagnostics.report(
-                                level = DiagnosticLevel.Debug,
-                                event = DiagnosticEvent.HostAvatarPrefill,
-                                message = "角标缓存尚未合成，模块先行铺上头像+角标",
-                                attributes = mapOf(
-                                    "package" to packageName,
-                                    "key" to rowSbn.key,
-                                    "verdict" to verdict.reason,
-                                    "size" to (prefillSize ?: 0).toString(),
-                                    "source" to HostAvatarComposition.lastSource,
-                                ),
-                                occurrence = OccurrencePolicy.Once("header_badge_prefill:${rowSbn.key}"),
-                            )
-                            return@install prefilled
-                        }
-                    }
+                    // No prefill here any more: the host composes the avatar picture itself —
+                    // mask, badge placement and all — and every local copy of it drew the shape
+                    // wrong (「头像形状切割得很奇怪」/「连带角标都被裁剪了」). Handing back `null`
+                    // lets the host write its own first frame, then its composed photo.
                     diagnostics.report(
                         level = DiagnosticLevel.Debug,
                         event = DiagnosticEvent.HostAvatarYield,
@@ -2346,55 +2315,22 @@ internal class NotificationPanelHooks(
                 HostAvatarPresence.looksLikeMonochromeMask(drawable))
 
     /**
-     * The "contact photo + app-icon badge" picture for [sbn], built with the host's own composer.
+     * Always null: the module does not compose avatar pictures any more.
      *
-     * Used as the repair *before* the theme-icon fallback: as long as the notification carries an
-     * avatar there is no reason to strip it from the row, and a row that lost its photo to a race
-     * is exactly the case where the host's cached composition is stale but the notification is
-     * fine. Returns null when there is nothing to compose (no large icon / not a picked package /
-     * theme engine still cold) — the caller then falls back to the themed icon as before.
+     * The host's `createBackgroundWithAppIcon` bakes the avatar mask and the corner badge into a
+     * single drawable, and every local copy of that picture got the geometry wrong — a round-rect
+     * mask read as 「头像形状切割的很奇怪」, and masking the badge inside the avatar's squircle
+     * shaved the badge instead (「连带角标都被裁剪了 恢复原生通知的形状 这块不要动」). Callers
+     * therefore fall through to the existing rules: never demote a row that carries a photo, and
+     * only a row with nothing to show gets the themed icon.
      */
+    @Suppress("UNUSED_PARAMETER")
     private fun composeAvatarForIcon(
         icon: ImageView,
         wrapper: Any?,
         sbn: StatusBarNotification,
         snapshot: RuntimeSnapshot,
-    ): Drawable? = runCatching {
-        val size = if (wrapper != null) {
-            headerContentSizePx(wrapper, icon)
-        } else {
-            when {
-                icon.width > 0 -> icon.width
-                lastHeaderContentSizePx > 0 -> lastHeaderContentSizePx
-                else -> (icon.resources.displayMetrics.density * FALLBACK_CONTENT_SIZE_DP).toInt()
-            }
-        }
-        if (size <= 0) return@runCatching null
-        // Aggregated rows always take the themed icon, so a summary never composes an avatar.
-        val preview = snapshot.resolver.composeHostAvatarPreview(
-            context = icon.context,
-            sbn = sbn,
-            contentSizePx = size,
-            allowGroupSummaryAvatar = false,
-        )
-        if (preview == null) {
-            // "The ladder had nothing better to write" needs a reason in the log, otherwise it
-            // reads the same as "this row has no avatar at all".
-            diagnostics.report(
-                level = DiagnosticLevel.Debug,
-                event = DiagnosticEvent.HostAvatarReplace,
-                message = "角标诊断：${sbn.packageName} 本地头像合成未产出",
-                attributes = mapOf(
-                    "package" to sbn.packageName,
-                    "key" to sbn.key,
-                    "size" to size.toString(),
-                    "material" to HostAvatarPresence.contains(sbn).toString(),
-                ),
-                occurrence = OccurrencePolicy.Once("host_avatar_paint_miss:${sbn.key}"),
-            )
-        }
-        preview?.also { lastHeaderContentSizePx = size }
-    }.getOrNull()
+    ): Drawable? = null
 
     /**
      * Last-resort net for callbacks SystemUI invokes on its main thread.
@@ -2855,144 +2791,21 @@ internal class NotificationPanelHooks(
     }
 
     /**
-     * ColorOS hides the "contact photo + app-icon badge" composition behind
-     * `withContext(Dispatchers.Default)` → `createBackgroundWithAppIcon(...)`. Until that coroutine
-     * comes back, the row shows the plain `smallIcon`, which reads as "先闪一下应用图标再跳成
-     * 头像". Composing the same picture synchronously here fills that window: the host result that
-     * arrives a frame or two later is the same visuals, so nothing jumps. Failures (missing helper,
-     * no avatar, unknown size) simply leave the host's own first frame in place.
+     * No-op.
+     *
+     * This used to compose "contact photo + themed badge" locally to fill the window before the
+     * host's own coroutine returned. The picture is not ours to draw: the host bakes the avatar
+     * mask and the badge into one result, so a redrawn copy changed the avatar outline and shaved
+     * the corner badge (「头像形状切割的很奇怪」→「连带角标都被裁剪了 恢复原生通知的形状」). The
+     * host now paints every frame of this sequence itself.
      */
+    @Suppress("UNUSED_PARAMETER")
     private fun prefillHostAvatar(
         icon: ImageView,
         wrapper: Any,
         sbn: StatusBarNotification,
         snapshot: RuntimeSnapshot,
     ) {
-        try {
-            val size = headerContentSizePx(wrapper, icon)
-            if (size <= 0) return
-            // Aggregated rows ("[2条] …") are summaries, and ColorOS never composes an avatar for
-            // them — but WeChat/WeCom service accounts still ship their own picture there. Compose
-            // it here for those rows as well, otherwise the row keeps the app icon for as long as
-            // the host's coroutine runs (the visible "原生图标一闪而过").
-            val summary = HostAvatarPresence.isGroupSummary(sbn)
-            val drawable = snapshot.resolver.composeHostAvatarPreview(
-                context = icon.context,
-                sbn = sbn,
-                contentSizePx = size,
-                allowGroupSummaryAvatar = false,
-            )
-            if (drawable == null) {
-                // The sender photo can land a beat after the row is first bound: WeChat posts the
-                // notification before the avatar is ready, so the extras probe misses and the host
-                // paints the plain app icon until its own composition lands. Retry briefly instead
-                // of waiting for that coroutine — the row then turns into the avatar within a
-                // couple of hundred milliseconds instead of "一闪而过".
-                val verdict = HostAvatarPresence.evaluate(icon.context, sbn)
-                diagnostics.report(
-                    level = DiagnosticLevel.Debug,
-                    event = DiagnosticEvent.HostAvatarPrefill,
-                    message = "头像暂不可用（${verdict.reason}），稍后补铺",
-                    attributes = mapOf(
-                        "package" to sbn.packageName,
-                        "key" to sbn.key,
-                        "verdict" to verdict.reason,
-                        "difference" to verdict.difference.toString(),
-                        "summary" to summary.toString(),
-                    ),
-                    occurrence = OccurrencePolicy.Once("panel:prefill_deferred:${sbn.key}"),
-                )
-                scheduleAvatarRefill(icon, wrapper, sbn, snapshot, 0)
-                return
-            }
-            lastHeaderContentSizePx = size
-            icon.setImageDrawable(drawable)
-            diagnostics.report(
-                level = DiagnosticLevel.Debug,
-                event = DiagnosticEvent.HostAvatarPrefill,
-                message = if (summary) {
-                    "宿主异步合成头像前先铺一帧同构图（聚合摘要），避免应用图标闪现"
-                } else {
-                    "宿主异步合成头像前先铺一帧同构图，避免应用图标闪现"
-                },
-                attributes = mapOf(
-                    "package" to sbn.packageName,
-                    "size" to size.toString(),
-                    "summary" to summary.toString(),
-                ),
-                occurrence = OccurrencePolicy.Once("panel:host_avatar_prefill:${sbn.packageName}"),
-            )
-        } catch (exception: Throwable) {
-            diagnostics.runtimeFailure(
-                scope = "panel:host_avatar_prefill",
-                message = "头像预合成失败，保留宿主第一帧",
-                cause = exception,
-                revision = snapshot.revision,
-            )
-        }
-    }
-
-    /**
-     * Retries the avatar composition for a row whose photo was not available yet, so the app icon
-     * the host painted on the first frame is replaced as soon as the picture exists instead of
-     * whenever the host's own coroutine happens to finish. Stops as soon as one attempt succeeds,
-     * when the row is detached, or when the configuration changed underneath.
-     *
-     * The notification is re-read from the row on every attempt, never taken from the argument:
-     * WeChat re-posts the message when it has loaded the sender photo, and that is a *new*
-     * `StatusBarNotification` with a new large icon. Evaluating the captured object forever is why
-     * a row judged `no-large-icon` on arrival stayed on the app icon until it was rebound.
-     */
-    private fun scheduleAvatarRefill(
-        icon: ImageView,
-        wrapper: Any,
-        sbn: StatusBarNotification,
-        snapshot: RuntimeSnapshot,
-        attempt: Int,
-    ) {
-        if (attempt >= AVATAR_REFILL_DELAYS_MILLIS.size) return
-        icon.postDelayed({
-            try {
-                if (!configuration.isCurrent(snapshot)) return@postDelayed
-                if (!icon.isAttachedToWindow) return@postDelayed
-                // A row can be recycled onto another notification while we wait; that row is no
-                // longer ours to fill.
-                val current = statusBarNotificationOfWrapper(wrapper)
-                if (current == null || current.key != sbn.key) return@postDelayed
-                val size = headerContentSizePx(wrapper, icon)
-                if (size <= 0) {
-                    scheduleAvatarRefill(icon, wrapper, current, snapshot, attempt + 1)
-                    return@postDelayed
-                }
-                val summary = HostAvatarPresence.isGroupSummary(current)
-                val drawable = snapshot.resolver.composeHostAvatarPreview(
-                    context = icon.context,
-                    sbn = current,
-                    contentSizePx = size,
-                    allowGroupSummaryAvatar = false,
-                )
-                if (drawable == null) {
-                    scheduleAvatarRefill(icon, wrapper, current, snapshot, attempt + 1)
-                    return@postDelayed
-                }
-                lastHeaderContentSizePx = size
-                icon.setImageDrawable(drawable)
-                diagnostics.report(
-                    level = DiagnosticLevel.Debug,
-                    event = DiagnosticEvent.HostAvatarPrefill,
-                    message = "头像到位，补铺第 ${attempt + 1} 次成功",
-                    attributes = mapOf(
-                        "package" to current.packageName,
-                        "key" to current.key,
-                        "size" to size.toString(),
-                        "summary" to summary.toString(),
-                    ),
-                    occurrence = OccurrencePolicy.Once("panel:avatar_refill:${current.key}"),
-                )
-            } catch (_: Throwable) {
-                // A detached or recycled row is the normal case here; nothing to report.
-            }
-        }, AVATAR_REFILL_DELAYS_MILLIS[attempt])
     }
 
     /**

@@ -453,42 +453,23 @@ internal class NotificationIconResolver(
     }
 
     /**
-     * Fills the window the host leaves open before its avatar composition lands.
+     * Always null: the module no longer pre-composes the avatar picture.
      *
-     * ColorOS runs `createBackgroundWithAppIcon` inside `withContext(Dispatchers.Default)`, so an
-     * avatar row first paints the plain `smallIcon` (the app icon) and only then swaps to the
-     * contact photo — the visible "先闪一下应用图标再跳成头像". When the module yields, it can
-     * pre-compose the very same drawable synchronously and hand it to the icon view; the coroutine
-     * result that arrives afterwards is the same picture, so the swap becomes invisible.
-     *
-     * Returns null — callers then leave the host untouchable — unless the notification really has
-     * an avatar to compose and the module would have drawn a theme badge on top of it.
+     * ColorOS runs `createBackgroundWithAppIcon` on `Dispatchers.Default`, so an avatar row paints
+     * the plain `smallIcon` for a frame or two before the contact photo lands. Pre-filling that
+     * window looked like the obvious fix, but every local copy of the picture drew the wrong thing:
+     * the host bakes the avatar mask **and** the badge into one result, so a redrawn version both
+     * changed the avatar outline and shaved the corner badge (reports: 「头像形状切割的很奇怪」,
+     * 「连带角标都被裁剪了 恢复原生通知的形状 这块不要动」). Geometry now stays entirely with the
+     * host; the module only swaps the badge argument inside its own call.
      */
+    @Suppress("UNUSED_PARAMETER")
     fun composeHostAvatarPreview(
         context: Context,
         sbn: StatusBarNotification,
         contentSizePx: Int,
         allowGroupSummaryAvatar: Boolean = false,
-    ): Drawable? {
-        if (!configLoaded) return null
-        if (!NotificationIconPolicy.isAvatarPriorityPackage(policyConfig, sbn.packageName)) return null
-        if (!HostAvatarPresence.contains(sbn)) return null
-        if (!HostAvatarPresence.canRenderAvatar(context, sbn, allowGroupSummaryAvatar)) return null
-        if (!panelThemeIconsEnabled()) return null
-        val badge = resolveThemeDrawableByPackage(context, sbn.packageName) ?: return null
-        val avatar = try {
-            HostAvatarPresence.avatarDrawable(context, sbn)
-        } catch (exception: Throwable) {
-            diagnostics.runtimeFailure(
-                scope = "icon_resolver:host_avatar_prefill",
-                message = "预览头像解码失败，交给宿主异步合成",
-                cause = exception,
-                revision = revision,
-            )
-            null
-        } ?: return null
-        return HostAvatarComposition.compose(context, avatar, badge, sbn.packageName, contentSizePx)
-    }
+    ): Drawable? = null
 
     fun shouldKeepHostAppIconBehavior(): Boolean =
         NotificationIconPolicy.shouldKeepHostAppIconBehavior(policyConfig, IconSurface.StatusBar)
