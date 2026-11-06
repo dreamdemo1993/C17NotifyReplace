@@ -140,6 +140,10 @@ private const val RUNTIME_LOG_INTERVAL_MILLIS = 60_000L
 private val TRACED_EVENTS = setOf(
     DiagnosticEvent.HostAvatarYield,
     DiagnosticEvent.HostAvatarReplace,
+    // Bumped for re.12.2: without it there is no line at all from the pre-composition path, so a
+    // row that never showed its photo reads exactly like a row that has no photo. The 「微信通知
+    // 成原生图标了」 report could not be told apart from "the host had nothing to wrap".
+    DiagnosticEvent.HostAvatarPrefill,
     DiagnosticEvent.IconReapplied,
     DiagnosticEvent.PackageIconResolved,
     // Rate-limited to one line per reason per minute, and the only record that tells "the row was

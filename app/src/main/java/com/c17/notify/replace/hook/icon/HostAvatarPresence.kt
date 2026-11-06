@@ -238,6 +238,22 @@ internal object HostAvatarPresence {
         }.getOrNull()?.let { sample(it) }?.also { smallIconSamples.put(sbn.key, it) }
 
     /**
+     * Sampled `largeIcon`, i.e. what the host is composing from.
+     *
+     * [looksLikeHostComposition] runs on every draw pass of every row, and decoding a `content://`
+     * large icon is a binder round trip plus a bitmap decode — the exact shape of the game-assistant
+     * jank. Keyed by notification key *and* post time so a re-post (which is how the photo arrives)
+     * is sampled afresh.
+     */
+    private fun avatarSample(context: Context, sbn: StatusBarNotification): IntArray? {
+        val cacheKey = sbn.key + "#" + sbn.postTime
+        return avatarSamples.get(cacheKey)
+            ?: avatarDrawable(context, sbn)?.let { sample(it) }?.also {
+                avatarSamples.put(cacheKey, it)
+            }
+    }
+
+    /**
      * Whether two drawables are, visually, the same picture.
      *
      * The header guard uses this with the artwork it saw in the slot *before* it wrote the themed
@@ -257,23 +273,81 @@ internal object HostAvatarPresence {
     }
 
     /**
-     * Whether [drawable] is a composition the host built itself — the round "photo + app-icon badge"
-     * picture ColorOS draws for rows that get the personal-avatar treatment.
+     * Whether [drawable] is a composition the host built itself **around a contact photo** — the
+     * round "photo + app-icon badge" picture ColorOS draws for rows that get the personal-avatar
+     * treatment.
      *
-     * This cannot be answered by comparing pixels, and that is exactly why the panel kept eating
-     * its own result: the main picture of such a composition is often the same glyph as
-     * `Notification#smallIcon`, and the badge only covers a corner, so inside the sampled window
-     * the alpha silhouette is nearly identical. [looksLikeNotificationSmallIcon] therefore said
-     * "this is the raw icon", the probe ladder concluded "the host never composed anything" three
-     * seconds later, and the row that had just shown an avatar jumped to the themed icon
-     * (report: 原生图标 → 跳变成主题图标，不显示个人头像 + 角标).
+     * Two things had to be separated here, and getting either wrong shows up as a different bug
+     * report:
      *
-     * The class name is the reliable part: the host composes through
-     * `LayerDrawableWithAppIconKt.createBackgroundWithAppIcon` and the result carries it in the
-     * type. Walk the hierarchy because builds differ in how many wrapper layers they add.
+     * * **Class name.** The host composes through
+     *   `LayerDrawableWithAppIconKt.createBackgroundWithAppIcon`, and the result keeps that name in
+     *   its type. Without this half, [looksLikeNotificationSmallIcon] reads the composition as "the
+     *   raw glyph is back" — the badge only covers a corner, so inside the sampled window the alpha
+     *   silhouette matches — and the row that had just shown an avatar is overwritten
+     *   (report: 原生图标 → 跳变成主题图标，不显示个人头像 + 角标).
+     * * **Content.** The same class is what the host builds when it has *no* photo to wrap: it then
+     *   puts the app's own glyph in the picture. Yielding to that is the opposite failure — the row
+     *   sits on the bare launcher icon (「微信通知成原生图标了」).
+     *
+     * So the class name is the gate and the content decides: matching the notification's own
+     * `largeIcon` means a real avatar; matching the launcher or small icon means an app-icon
+     * composition that may be replaced. Anything unrecognised keeps yielding, because painting over
+     * a contact photo is the one mistake this module must not make.
      */
-    fun looksLikeHostComposition(drawable: Drawable?): Boolean {
-        var type: Class<*>? = drawable?.javaClass
+    fun looksLikeHostComposition(
+        drawable: Drawable?,
+        context: Context? = null,
+        sbn: StatusBarNotification? = null,
+    ): Boolean {
+        if (drawable == null) return false
+        if (!hasCompositionTypeName(drawable)) return false
+        // The type only says "the host built a layered picture here", not what it wrapped. When
+        // there is no photo to wrap — the app shipped no large icon, or its picture was still
+        // being written — ColorOS composes the very same class around the app's own glyph, and
+        // yielding to *that* is what left the row on the bare launcher icon after re.12.1
+        // (report: 「微信通知成原生图标了」). So ask the artwork:
+        //   · matches the notification's own large icon  → a real avatar, hands off
+        //   · matches the launcher icon / small icon     → an app-icon composition, replaceable
+        //   · neither                                    → unknown, keep yielding (the safe side)
+        if (context == null || sbn == null) return true
+        val pixels = sample(drawable) ?: return true
+        avatarSample(context, sbn)?.let { avatar ->
+            val difference = differenceOf(pixels, avatar) ?: Double.MAX_VALUE
+            if (difference < HOSTED_PLACEHOLDER_TOLERANCE) return true
+        }
+        launcherSample(context, sbn.packageName)?.let { reference ->
+            val difference = differenceOf(pixels, reference) ?: Double.MAX_VALUE
+            if (difference < HOSTED_PLACEHOLDER_TOLERANCE) return false
+        }
+        smallIconSample(context, sbn)?.let { reference ->
+            val difference = differenceOf(pixels, reference) ?: Double.MAX_VALUE
+            if (difference < HOSTED_PLACEHOLDER_TOLERANCE) return false
+            val shape = alphaDifferenceOf(pixels, reference) ?: Double.MAX_VALUE
+            if (shape < HOSTED_SHAPE_TOLERANCE) return false
+        }
+        return true
+    }
+
+    /**
+     * Whether [drawable] carries the host's layered composition *shape*, regardless of what it
+     * wrapped — i.e. "ColorOS has already answered for this row".
+     *
+     * Used by the probe ladder to stop waiting: once a layered picture is in the slot, the host has
+     * finished its composition for this post, so a picture that is still the app glyph means it had
+     * nothing else to wrap. Waiting out the rest of the window only keeps the bare icon on screen
+     * (report: 「微信通知成原生图标了」). A photo that shows up later arrives as a re-post and is
+     * judged afresh anyway.
+     */
+    fun hasHostCompositionShape(drawable: Drawable?): Boolean =
+        drawable != null && hasCompositionTypeName(drawable)
+
+    /**
+     * The class-name half of [looksLikeHostComposition]: `LayerDrawableWithAppIconKt` builds the
+     * host's composition, and the wrapper keeps the name in the type on every build seen so far.
+     */
+    private fun hasCompositionTypeName(drawable: Drawable): Boolean {
+        var type: Class<*>? = drawable.javaClass
         var depth = 0
         while (depth < 8) {
             val current = type ?: return false
@@ -311,7 +385,7 @@ internal object HostAvatarPresence {
         // A composition the host built around the avatar must never read as "the raw glyph is
         // back": its corner badge leaves the centre silhouette almost untouched, so the alpha
         // comparison below would happily match it and the caller would paint over a real avatar.
-        if (looksLikeHostComposition(drawable)) return false
+        if (looksLikeHostComposition(drawable, context, sbn)) return false
         val pixels = sample(drawable) ?: return false
         val reference = smallIconSample(context, sbn) ?: return false
         differenceOf(pixels, reference)?.let { if (it < HOSTED_PLACEHOLDER_TOLERANCE) return true }
@@ -676,6 +750,9 @@ internal object HostAvatarPresence {
 
     /** Sampled `smallIcon` per notification key, for the same reason. */
     private val smallIconSamples = LruCache<String, IntArray>(48)
+
+    /** Sampled `largeIcon` per notification key + post time; see [avatarSample]. */
+    private val avatarSamples = LruCache<String, IntArray>(48)
 
     /** [Verdict.reason] meaning the row is a collapsed group summary with no photo of its own. */
     const val REASON_GROUP_SUMMARY = "group-summary"

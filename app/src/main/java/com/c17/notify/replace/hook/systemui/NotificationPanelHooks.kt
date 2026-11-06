@@ -2153,6 +2153,10 @@ internal class NotificationPanelHooks(
         // seconds later — deciding "宿主没画" and forcing the theme icon, so the row that *had* a
         // photo was left with no avatar at all.
         var hostArtwork: Drawable? = null
+        // When the ladder was armed. Posted on the view, so the system may freeze it for minutes
+        // (screen off, doze) and fire a late pass against a slot that has been rebound since —
+        // see the overrun check inside the lambda.
+        val armedAt = SystemClock.elapsedRealtime()
         if (!verdict.renderable) {
             diagnostics.report(
                 level = DiagnosticLevel.Debug,
@@ -2174,6 +2178,16 @@ internal class NotificationPanelHooks(
                 // same net as the draw callbacks. The body keeps its own early returns.
                 try {
                 if (!configuration.isCurrent(snapshot) || !icon.isAttachedToWindow) return@postDelayed
+                // A pass that arrives far outside the window it was armed for is not evidence of
+                // anything: the row was rebound, the panel slept, and whatever sits in the slot now
+                // belongs to a different draw. The 21:37/21:39 report is exactly this — pass 0
+                // yielded on the host's own composition, pass 4 ran two minutes later against a
+                // rebound slot and forced the themed icon over a row that had just shown a photo.
+                if (SystemClock.elapsedRealtime() - armedAt >
+                    ladder.last() + LADDER_OVERRUN_MILLIS
+                ) {
+                    return@postDelayed
+                }
                 // A guard already holding this slot means an earlier pass decided the avatar never
                 // came; it re-checks on every draw, so this ladder is done.
                 if (headerPlaceholderGuards[icon] != null) return@postDelayed
@@ -2182,6 +2196,12 @@ internal class NotificationPanelHooks(
                     .getOrNull()
                 if (currentKey != null && currentKey != sbn.key) return@postDelayed
                 val current = icon.drawable ?: return@postDelayed
+                // A layered picture in the slot means ColorOS has already finished composing for
+                // this post. If its content still reads as the bare glyph, the host had nothing
+                // else to wrap — so the rest of the window only keeps that glyph on screen
+                // (report: 「微信通知成原生图标了」). It does not make the row replaceable by
+                // itself, it just means "stop waiting for a better answer from this post".
+                val hostAnswered = HostAvatarPresence.hasHostCompositionShape(current)
                 if (!looksLikeRawIcon(icon.context, sbn, current)) {
                     hostArtwork = current
                     diagnostics.report(
@@ -2223,8 +2243,9 @@ internal class NotificationPanelHooks(
                 }
                 // Give the host the first sample to itself. On a cold start it is still starting the
                 // app's process to read the photo, and composing here would take the main thread
-                // away from the very work we are waiting for.
-                if (index == 0) return@postDelayed
+                // away from the very work we are waiting for. A composition that already landed is
+                // the exception: there is nothing left to wait for on this pass.
+                if (index == 0 && !hostAnswered) return@postDelayed
                 // The slot still holds the bare glyph, but the photo may well be sitting in the
                 // notification while the host's composition lost the race (or its cache still
                 // holds a placeholder-era result). Compose that avatar here instead of dropping to
@@ -2251,13 +2272,21 @@ internal class NotificationPanelHooks(
                     )
                     return@postDelayed
                 }
+                // A row that is *known* to carry a contact photo is never demoted here. The themed
+                // icon covers both the avatar and the badge, so writing it is strictly worse than
+                // leaving whatever the host painted — and WeChat re-posts the notification once its
+                // picture is written, which re-enters this whole decision with the photo present.
+                // (Report: 「微信通知成原生图标了」 is the opposite failure; this branch is the one
+                // that produced 「第一条还是主题图标」.)
+                if (verdict.renderable && !verdict.provisional) return@postDelayed
                 // Cold-start gate: composing needs the remote config *and* the themed badge, and
                 // on a fresh SystemUI both can still be missing while the slot legitimately shows
                 // the bare glyph. Giving up here pins the theme icon for good — the force-installed
                 // guard makes every later pass return at the `guards[icon] != null` check — so a
                 // notification that carries avatar material simply waits for the next pass. Only
                 // the last pass may fall back, and by then the ladder has had ten seconds.
-                if (index < ladder.lastIndex &&
+                if (!hostAnswered &&
+                    index < ladder.lastIndex &&
                     (verdict.provisional || HostAvatarPresence.contains(sbn))
                 ) {
                     return@postDelayed
@@ -2309,7 +2338,7 @@ internal class NotificationPanelHooks(
         // Checked first and on its own: the host's "avatar + badge" picture shares the centre of
         // the artwork with the bare glyph it replaces, so every content comparison below can match
         // it and the caller then overwrites a real avatar (see looksLikeHostComposition).
-        !HostAvatarPresence.looksLikeHostComposition(drawable) &&
+        !HostAvatarPresence.looksLikeHostComposition(drawable, context, sbn) &&
             (HostAvatarPresence.looksLikeNotificationSmallIcon(context, sbn, drawable) ||
                 HostAvatarPresence.looksLikeLauncherIcon(context, sbn.packageName, drawable) ||
                 HostAvatarPresence.looksBlank(drawable) ||
@@ -2341,12 +2370,29 @@ internal class NotificationPanelHooks(
         }
         if (size <= 0) return@runCatching null
         // Aggregated rows always take the themed icon, so a summary never composes an avatar.
-        snapshot.resolver.composeHostAvatarPreview(
+        val preview = snapshot.resolver.composeHostAvatarPreview(
             context = icon.context,
             sbn = sbn,
             contentSizePx = size,
             allowGroupSummaryAvatar = false,
-        )?.also { lastHeaderContentSizePx = size }
+        )
+        if (preview == null) {
+            // "The ladder had nothing better to write" needs a reason in the log, otherwise it
+            // reads the same as "this row has no avatar at all".
+            diagnostics.report(
+                level = DiagnosticLevel.Debug,
+                event = DiagnosticEvent.HostAvatarReplace,
+                message = "角标诊断：${sbn.packageName} 本地头像合成未产出",
+                attributes = mapOf(
+                    "package" to sbn.packageName,
+                    "key" to sbn.key,
+                    "size" to size.toString(),
+                    "material" to HostAvatarPresence.contains(sbn).toString(),
+                ),
+                occurrence = OccurrencePolicy.Once("host_avatar_paint_miss:${sbn.key}"),
+            )
+        }
+        preview?.also { lastHeaderContentSizePx = size }
     }.getOrNull()
 
     /**
@@ -2560,7 +2606,7 @@ internal class NotificationPanelHooks(
          * unknown drawable, i.e. on exactly that refill).
          */
         private fun isHostPlaceholder(drawable: Drawable): Boolean =
-            !HostAvatarPresence.looksLikeHostComposition(drawable) &&
+            !HostAvatarPresence.looksLikeHostComposition(drawable, icon.context, sbn) &&
                 (isHostAppIconPlaceholder(drawable) ||
                     HostAvatarPresence.looksLikeSameArtwork(drawable, hostArtwork) ||
                     HostAvatarPresence.looksLikeNotificationSmallIcon(icon.context, sbn, drawable))
@@ -3095,6 +3141,17 @@ internal class NotificationPanelHooks(
          * place allowed to give up.
          */
         val HOST_AVATAR_GRACE_MILLIS = longArrayOf(700L, 1600L, 3000L, 6000L, 10_000L)
+
+        /**
+         * How late a pass may arrive and still count as evidence about the slot.
+         *
+         * The ladder is a chain of `View#postDelayed` callbacks, and the platform is free to hold
+         * them: screen off, doze, a frozen SystemUI. The last pass of a cold-start reboot run was
+         * observed firing **two minutes** after it was armed, against a slot that had been rebound
+         * in the meantime, and it forced the themed icon over a row that had just shown an avatar.
+         * Beyond this overdue margin the pass is dropped instead of acted on.
+         */
+        const val LADDER_OVERRUN_MILLIS = 5_000L
 
         /**
          * How long a *provisional* "no avatar" verdict may sit on the slot before the row is
