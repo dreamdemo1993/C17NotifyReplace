@@ -26,7 +26,6 @@ internal enum class DiagnosticEvent(val id: String) {
     PanelRowSkipped("icon.row_skipped"),
     HostAvatarYield("icon.host_avatar_yield"),
     HostAvatarReplace("icon.host_avatar_replace"),
-    HostAvatarPrefill("icon.host_avatar_prefill"),
     PackageIconResolved("icon.package_icon_resolved"),
     GameAssistantIconReplaced("games.icon_replaced"),
     GameAssistantIconSkipped("games.icon_skipped"),

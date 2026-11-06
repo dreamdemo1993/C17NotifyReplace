@@ -1,13 +1,11 @@
 package com.c17.notify.replace.hook.systemui
 
-import android.app.Notification
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffColorFilter
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.Icon
-import android.provider.Settings
 import android.service.notification.StatusBarNotification
 import android.view.View
 import android.widget.ImageView
@@ -17,7 +15,6 @@ import com.c17.notify.replace.diagnostics.DiagnosticLevel
 import com.c17.notify.replace.diagnostics.Diagnostics
 import com.c17.notify.replace.diagnostics.OccurrencePolicy
 import com.c17.notify.replace.hook.HookRegistrar
-import com.c17.notify.replace.hook.icon.HostAvatarPresence
 import com.c17.notify.replace.hook.runtimeFailure
 import java.util.Collections
 import java.util.WeakHashMap
@@ -302,68 +299,22 @@ internal class LockScreenCapsuleHooks(
         if (!lockScreenCapsuleEnabled()) return null
         val snapshot = configuration.snapshot
         // The lock screen is the one surface where ColorOS never composes the contact photo: the
-        // capsule draws the plain app icon, which is why the theme icon below is resolved
-        // unconditionally. A row that really carries a sender photo — WeChat's aggregated
-        // "[2条] …" included — has to keep it here too, otherwise the lock screen shows the app
-        // icon while the notification centre next to it shows "avatar + badge".
+        // capsule draws the plain app icon, and the module does not compose that picture itself
+        // either — the host bakes the avatar mask and the corner badge into one result, and every
+        // local copy of it came out with the wrong geometry. So the capsule always gets the theme
+        // icon. That also keeps the "hide notification content" promise for free: a sender photo is
+        // never drawn here, whatever the switches say.
         sbn?.let { notification ->
-            val verdict = HostAvatarPresence.evaluate(
-                context = context,
-                sbn = notification,
-                allowGroupSummaryAvatar = true,
-            )
-            // "Hide notification content" is a privacy promise: the lock screen must not show who
-            // wrote in, and the sender photo *is* that answer. Compose the theme icon for the
-            // capsule instead of the "avatar + badge" picture — the photo stays on the unlocked
-            // panel, where the same row is rendered in its public form.
-            val contentHidden = isLockScreenContentHidden(context, notification)
             diagnostics.report(
                 level = DiagnosticLevel.Debug,
                 event = DiagnosticEvent.PackageIconResolved,
-                message = "锁屏胶囊判定：${notification.packageName} verdict=${verdict.reason}" +
-                    (if (contentHidden) "（锁屏已隐藏通知内容，用主题图标）" else ""),
+                message = "锁屏胶囊：${notification.packageName} 使用主题图标",
                 attributes = mapOf(
                     "package" to notification.packageName,
                     "key" to notification.key,
-                    "verdict" to verdict.reason,
-                    "difference" to verdict.difference.toString(),
-                    "hidden" to contentHidden.toString(),
                 ),
                 occurrence = OccurrencePolicy.Once("lockscreen:capsule:verdict:${notification.key}"),
             )
-            if (!contentHidden &&
-                verdict.renderable &&
-                verdict.reason == HostAvatarPresence.REASON_CONTACT_PHOTO
-            ) {
-                val composed = snapshot.resolver.composeHostAvatarPreview(
-                    context = context,
-                    sbn = notification,
-                    contentSizePx = capsuleAvatarSizePx(context),
-                    allowGroupSummaryAvatar = true,
-                )
-                val composedBitmap = composed?.let { runCatching { it.toBitmap() }.getOrNull() }
-                if (composed != null && composedBitmap != null) {
-                    replacementDrawables.add(composed)
-                    diagnostics.report(
-                        level = DiagnosticLevel.Info,
-                        event = DiagnosticEvent.PackageIconResolved,
-                        message = "锁屏胶囊：${notification.packageName} 有真头像，按头像+角标合成",
-                        attributes = mapOf(
-                            "package" to notification.packageName,
-                            "key" to notification.key,
-                            "verdict" to verdict.reason,
-                            "difference" to verdict.difference.toString(),
-                        ),
-                        occurrence = OccurrencePolicy.Once("lockscreen:capsule:avatar:${notification.key}"),
-                    )
-                    return ReplacementPlan(
-                        snapshot = snapshot,
-                        icon = Icon.createWithBitmap(composedBitmap),
-                        drawable = composed,
-                        isColorable = false,
-                    )
-                }
-            }
         }
         // The capsule draws the plain app icon, exactly like the status bar and the notification
         // centre do — the contact photo of an avatar package is composed by the host in the header,
@@ -467,15 +418,6 @@ internal class LockScreenCapsuleHooks(
     }
 
     /**
-     * Content size for the composed avatar. ColorOS lays the capsule row icon out at roughly 48dp,
-     * so composing at that size keeps the bitmap close to 1:1 with the view and the photo sharp.
-     */
-    private fun capsuleAvatarSizePx(context: Context): Int =
-        (CAPSULE_ICON_SIZE_DP * context.resources.displayMetrics.density)
-            .toInt()
-            .coerceAtLeast(1)
-
-    /**
      * Package-name variant used by the "hide notification content" form, where ColorOS never builds a
      * per-notification bundle and therefore hands over neither an [Icon] nor a [StatusBarNotification].
      */
@@ -544,39 +486,5 @@ internal class LockScreenCapsuleHooks(
             .invoke(null) as? Context
     } catch (_: Throwable) {
         null
-    }
-
-    /**
-     * Whether the lock screen is currently withholding notification content.
-     *
-     * Two independent switches decide that, and either one is enough:
-     * `Settings.Secure.lock_screen_allow_private_notifications == 0` is the system-wide "hide
-     * notification content" toggle ColorOS writes when the user turns it on, and
-     * `Notification.visibility == VISIBILITY_SECRET` is the app asking for a redacted lock-screen
-     * form by itself. A sender photo answers "who wrote this", so it must not be composed while
-     * either switch is on — the capsule falls through to the theme icon instead.
-     */
-    private fun isLockScreenContentHidden(
-        context: Context,
-        sbn: StatusBarNotification,
-    ): Boolean {
-        val allowPrivate = runCatching {
-            Settings.Secure.getInt(
-                context.contentResolver,
-                SETTING_LOCK_SCREEN_ALLOW_PRIVATE,
-                1,
-            )
-        }.getOrDefault(1)
-        if (allowPrivate == 0) return true
-        return runCatching { sbn.notification.visibility == Notification.VISIBILITY_SECRET }
-            .getOrDefault(false)
-    }
-
-    private companion object {
-        /** Laid-out size of the capsule row icon; the composed avatar is drawn at this size. */
-        const val CAPSULE_ICON_SIZE_DP = 48f
-
-        /** AOSP switch behind "hide notification content" on the lock screen. */
-        const val SETTING_LOCK_SCREEN_ALLOW_PRIVATE = "lock_screen_allow_private_notifications"
     }
 }

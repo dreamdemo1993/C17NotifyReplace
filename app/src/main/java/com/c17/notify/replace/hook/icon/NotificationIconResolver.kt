@@ -452,25 +452,6 @@ internal class NotificationIconResolver(
         return yield
     }
 
-    /**
-     * Always null: the module no longer pre-composes the avatar picture.
-     *
-     * ColorOS runs `createBackgroundWithAppIcon` on `Dispatchers.Default`, so an avatar row paints
-     * the plain `smallIcon` for a frame or two before the contact photo lands. Pre-filling that
-     * window looked like the obvious fix, but every local copy of the picture drew the wrong thing:
-     * the host bakes the avatar mask **and** the badge into one result, so a redrawn version both
-     * changed the avatar outline and shaved the corner badge (reports: 「头像形状切割的很奇怪」,
-     * 「连带角标都被裁剪了 恢复原生通知的形状 这块不要动」). Geometry now stays entirely with the
-     * host; the module only swaps the badge argument inside its own call.
-     */
-    @Suppress("UNUSED_PARAMETER")
-    fun composeHostAvatarPreview(
-        context: Context,
-        sbn: StatusBarNotification,
-        contentSizePx: Int,
-        allowGroupSummaryAvatar: Boolean = false,
-    ): Drawable? = null
-
     fun shouldKeepHostAppIconBehavior(): Boolean =
         NotificationIconPolicy.shouldKeepHostAppIconBehavior(policyConfig, IconSurface.StatusBar)
 

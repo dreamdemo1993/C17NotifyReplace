@@ -54,19 +54,6 @@ internal class NotificationPanelHooks(
      */
     private val headerBadgeRow = ThreadLocal<StatusBarNotification?>()
 
-    /** `OplusNotificationHeaderViewWrapperExImp.resolveHeaderIconContentSizePx()`, resolved once. */
-    @Volatile
-    private var contentSizeMethod: Method? = null
-    private var contentSizeMethodResolved = false
-
-    /**
-     * The box size the header icon is composed into, remembered from the last prefill. The badge
-     * hook runs synchronously from the host's own rounding pass and has no wrapper to ask, so this
-     * is the only size available when it has to compose an avatar itself.
-     */
-    @Volatile
-    private var lastHeaderContentSizePx = 0
-
     fun install() {
         installOplusHeaderHooks()
         installHostCompositionHook()
@@ -1369,8 +1356,8 @@ internal class NotificationPanelHooks(
      * stays on the plain `smallIcon` for good — the "icon not replaced" rows in the shade.
      *
      * Re-applying right after the host returns wins the race by construction: this is its last write,
-     * and the re-apply resolves the same plan the rest of the panel uses (avatar rows yield to
-     * [prefillHostAvatar], everything else gets the themed icon).
+     * and the re-apply resolves the same plan the rest of the panel uses (avatar rows yield to the
+     * host untouched, everything else gets the themed icon).
      */
     private fun installOplusHeaderBadgeApplyReapply(oplusHeader: OplusHeaderMembers) {
         val method = oplusHeader.applyExpandedCanvasIconWithBadge ?: return
@@ -1623,8 +1610,12 @@ internal class NotificationPanelHooks(
                 )
             }
             if (plan == null) {
-                // Yielding to the host avatar. ColorOS composes that avatar asynchronously, so the
-                // row would paint the plain small icon first; pre-compose it here instead.
+                // Yielding to the host avatar. ColorOS composes that avatar asynchronously on its
+                // own dispatcher, so the row paints the plain small icon (or an "app icon + badge"
+                // composition) for a moment first. That intermediate is the host's, and the module
+                // deliberately does not pre-draw anything here: the host bakes the avatar mask and
+                // the corner badge into one picture, and every local copy of it came out with the
+                // wrong outline (「头像形状切割的很奇怪」, 「连带角标都被裁剪了」).
                 if (target == PanelIconTarget.Header) {
                     // An earlier bind of this very icon may have reached the opposite conclusion
                     // ("no avatar in this notification") and installed the themed-icon guard. That
@@ -1638,7 +1629,6 @@ internal class NotificationPanelHooks(
                     if (verdict.renderable || verdict.provisional) {
                         headerPlaceholderGuards.remove(icon)?.stop()
                     }
-                    prefillHostAvatar(icon, wrapper, sbn, snapshot)
                     // plan is null here only when the theme engine itself failed (a yield would
                     // have produced a replacement plan for every no-avatar row since 5.4). The
                     // guard stays as the cold-start net: it resolves the themed icon lazily and
@@ -1648,7 +1638,7 @@ internal class NotificationPanelHooks(
                     // [canRenderAvatar] is a *prediction*; when it says "photo" the guard installs
                     // late instead of not at all, so a host that never paints the photo cannot
                     // leave the row on its raw icon.
-                    guardHeaderIfHostSkipsAvatar(icon, row, sbn, snapshot, wrapper)
+                    guardHeaderIfHostSkipsAvatar(icon, row, sbn, snapshot)
                 }
                 // An aggregated row that just yielded still has to end up with *something*: when
                 // the host has no photo to compose it paints its own monochrome artwork, and for
@@ -1729,7 +1719,7 @@ internal class NotificationPanelHooks(
      * 每轮只在 drawable 已不是我们写的那张时补铺，实例一致就安静地进入下一轮。
      *
      * 只针对模块接管的行（`plan != null`），所以不会和让路头像互相拉扯 —— 让路时
-     * `applyPanelIcon` 会走 `prefillHostAvatar` 重新合成头像而不是写主题图标。
+     * `applyPanelIcon` 直接返回、把头像槽交给宿主，不存在本模块写下的 drawable 需要补铺。
      */
     private fun verifyIconAfterWrite(
         icon: ImageView,
@@ -2089,8 +2079,6 @@ internal class NotificationPanelHooks(
         row: Any?,
         sbn: StatusBarNotification,
         snapshot: RuntimeSnapshot,
-        /** The view wrapper this icon belongs to; only used to ask the host for its content size. */
-        wrapper: Any? = null,
     ) {
         val verdict = HostAvatarPresence.evaluate(icon.context, sbn)
         if (!verdict.renderable && !verdict.provisional) {
@@ -2166,11 +2154,9 @@ internal class NotificationPanelHooks(
                     .getOrNull()
                 if (currentKey != null && currentKey != sbn.key) return@postDelayed
                 val current = icon.drawable ?: return@postDelayed
-                // A layered picture in the slot means ColorOS has already finished composing for
-                // this post. If its content still reads as the bare glyph, the host had nothing
-                // else to wrap — so the rest of the window only keeps that glyph on screen
-                // (report: 「微信通知成原生图标了」). It does not make the row replaceable by
-                // itself, it just means "stop waiting for a better answer from this post".
+                // Whether the slot already holds a layered picture. Only used to decide whether
+                // pass 0 has anything left to wait for — it must not shorten the window: see the
+                // demote gate below.
                 val hostAnswered = HostAvatarPresence.hasHostCompositionShape(current)
                 if (!looksLikeRawIcon(icon.context, sbn, current)) {
                     hostArtwork = current
@@ -2212,36 +2198,10 @@ internal class NotificationPanelHooks(
                     return@postDelayed
                 }
                 // Give the host the first sample to itself. On a cold start it is still starting the
-                // app's process to read the photo, and composing here would take the main thread
-                // away from the very work we are waiting for. A composition that already landed is
-                // the exception: there is nothing left to wait for on this pass.
+                // app's process to read the photo, and working on this pass would take the main
+                // thread away from the very work we are waiting for. A composition that already
+                // landed is the exception: there is nothing left to wait for on this pass.
                 if (index == 0 && !hostAnswered) return@postDelayed
-                // The slot still holds the bare glyph, but the photo may well be sitting in the
-                // notification while the host's composition lost the race (or its cache still
-                // holds a placeholder-era result). Compose that avatar here instead of dropping to
-                // the theme icon: a row that *has* a sender photo must never be turned into a
-                // themed badge, which is exactly what the blind fallback did (report: 「第一条消息
-                // 直接变成了主题图标 没有头像」— WeChat re-posts with the photo ~9s after the post,
-                // the re-post yielded and this ladder then overwrote the row with the theme icon).
-                val composed = composeAvatarForIcon(icon, wrapper, sbn, snapshot)
-                if (composed != null) {
-                    icon.clearColorFilter()
-                    icon.imageTintList = null
-                    icon.setImageDrawable(composed)
-                    diagnostics.report(
-                        level = DiagnosticLevel.Info,
-                        event = DiagnosticEvent.HostAvatarReplace,
-                        message = "角标诊断：${sbn.packageName} 头像位仍是原样图标，" +
-                            "改用本模块预合成的头像",
-                        attributes = mapOf(
-                            "package" to sbn.packageName,
-                            "key" to sbn.key,
-                            "pass" to index.toString(),
-                        ),
-                        occurrence = OccurrencePolicy.Once("host_avatar_composed:${sbn.key}"),
-                    )
-                    return@postDelayed
-                }
                 // A row that is *known* to carry a contact photo is never demoted here. The themed
                 // icon covers both the avatar and the badge, so writing it is strictly worse than
                 // leaving whatever the host painted — and WeChat re-posts the notification once its
@@ -2249,22 +2209,24 @@ internal class NotificationPanelHooks(
                 // (Report: 「微信通知成原生图标了」 is the opposite failure; this branch is the one
                 // that produced 「第一条还是主题图标」.)
                 if (verdict.renderable && !verdict.provisional) return@postDelayed
-                // Cold-start gate: composing needs the remote config *and* the themed badge, and
-                // on a fresh SystemUI both can still be missing while the slot legitimately shows
-                // the bare glyph. Giving up here pins the theme icon for good — the force-installed
-                // guard makes every later pass return at the `guards[icon] != null` check — so a
-                // notification that carries avatar material simply waits for the next pass. Only
-                // the last pass may fall back, and by then the ladder has had ten seconds.
-                if (!hostAnswered &&
-                    index < ladder.lastIndex &&
-                    (verdict.provisional || HostAvatarPresence.contains(sbn))
-                ) {
-                    return@postDelayed
-                }
+                // Demoting here is irrevocable in practice — the guard installed below makes every
+                // later pass return at the `guards[icon] != null` check — and it strips both the
+                // avatar and the badge, so only the **last** pass may do it.
+                //
+                // Nothing shortens that wait, in particular not a layered picture in the slot. That
+                // used to be read as "ColorOS has answered for this post, stop waiting" (re.12.4),
+                // but the answer can be a placeholder: WeChat's first message after a reboot carries
+                // no `largeIcon` of its own, so the host composes "app icon + badge" straight away
+                // and paints the sender photo from its contact store only seconds later. Every row
+                // that reaches this point is `provisional` — the verdict itself says the artwork has
+                // not been committed to yet — so it gets the whole window regardless of what type is
+                // currently in the slot.
+                if (index < ladder.lastIndex) return@postDelayed
                 diagnostics.report(
                     level = DiagnosticLevel.Info,
                     event = DiagnosticEvent.HostAvatarReplace,
-                    message = "角标诊断：${sbn.packageName} 判为有头像但宿主没画（仍是原样图标），改用主题图标",
+                    message = "角标诊断：${sbn.packageName} 到最后一拍头像位仍是原样图标" +
+                        "（${verdict.reason}），改用主题图标",
                     attributes = mapOf(
                         "package" to sbn.packageName,
                         "key" to sbn.key,
@@ -2313,24 +2275,6 @@ internal class NotificationPanelHooks(
                 HostAvatarPresence.looksLikeLauncherIcon(context, sbn.packageName, drawable) ||
                 HostAvatarPresence.looksBlank(drawable) ||
                 HostAvatarPresence.looksLikeMonochromeMask(drawable))
-
-    /**
-     * Always null: the module does not compose avatar pictures any more.
-     *
-     * The host's `createBackgroundWithAppIcon` bakes the avatar mask and the corner badge into a
-     * single drawable, and every local copy of that picture got the geometry wrong — a round-rect
-     * mask read as 「头像形状切割的很奇怪」, and masking the badge inside the avatar's squircle
-     * shaved the badge instead (「连带角标都被裁剪了 恢复原生通知的形状 这块不要动」). Callers
-     * therefore fall through to the existing rules: never demote a row that carries a photo, and
-     * only a row with nothing to show gets the themed icon.
-     */
-    @Suppress("UNUSED_PARAMETER")
-    private fun composeAvatarForIcon(
-        icon: ImageView,
-        wrapper: Any?,
-        sbn: StatusBarNotification,
-        snapshot: RuntimeSnapshot,
-    ): Drawable? = null
 
     /**
      * Last-resort net for callbacks SystemUI invokes on its main thread.
@@ -2790,56 +2734,6 @@ internal class NotificationPanelHooks(
         }
     }
 
-    /**
-     * No-op.
-     *
-     * This used to compose "contact photo + themed badge" locally to fill the window before the
-     * host's own coroutine returned. The picture is not ours to draw: the host bakes the avatar
-     * mask and the badge into one result, so a redrawn copy changed the avatar outline and shaved
-     * the corner badge (「头像形状切割的很奇怪」→「连带角标都被裁剪了 恢复原生通知的形状」). The
-     * host now paints every frame of this sequence itself.
-     */
-    @Suppress("UNUSED_PARAMETER")
-    private fun prefillHostAvatar(
-        icon: ImageView,
-        wrapper: Any,
-        sbn: StatusBarNotification,
-        snapshot: RuntimeSnapshot,
-    ) {
-    }
-
-    /**
-     * `resolveHeaderIconContentSizePx()` is the very value the host boxes into its composer; the
-     * laid-out width is only a fallback for builds that renamed it.
-     *
-     * A freshly bound row is not measured yet, so both can come back as zero — and a zero size used
-     * to abort the avatar prefill silently, which is why a whole session can log yields and not a
-     * single prefill: the row then keeps the host's "app icon + badge" composition, and the avatar
-     * only appears once the row is rebound (expanding the group). Fall back to the size the last
-     * composition used, and then to the density-derived default, so the composer always has a box.
-     */
-    private fun headerContentSizePx(wrapper: Any, icon: ImageView): Int {
-        resolveContentSizeMethod(wrapper)?.let { method ->
-            runCatching { method.invoke(wrapper) as Int }.getOrNull()
-                ?.takeIf { it > 0 }
-                ?.let { return it }
-        }
-        return when {
-            icon.width > 0 -> icon.width
-            lastHeaderContentSizePx > 0 -> lastHeaderContentSizePx
-            else -> (icon.resources.displayMetrics.density * FALLBACK_CONTENT_SIZE_DP).toInt()
-        }
-    }
-
-    private fun resolveContentSizeMethod(wrapper: Any): Method? {
-        contentSizeMethod?.let { return it }
-        if (contentSizeMethodResolved) return null
-        contentSizeMethodResolved = true
-        return runCatching {
-            wrapper.javaClass.getMethod("resolveHeaderIconContentSizePx").also { contentSizeMethod = it }
-        }.getOrNull()
-    }
-
     private fun statusBarNotificationFromRow(row: Any): StatusBarNotification? {
         val entry = members.expandableRowGetEntry.invoke(row) ?: return null
         return members.notificationEntryGetSbn.invoke(entry) as? StatusBarNotification
@@ -3021,21 +2915,5 @@ internal class NotificationPanelHooks(
      * IconTakeover, or genuinely absent and the host keeps its own artwork.
      */
     val GROUP_SUMMARY_REFILL_DELAYS_MILLIS = longArrayOf(256L, 512L, 1024L, 2048L)
-
-        /**
-         * Retry schedule for a row whose sender photo was not attached yet when it was first bound.
-         * The first few attempts only have to beat the host's own asynchronous composition
-         * (observed around 0.7 s after the row appears); the longer tail covers WeChat re-posting
-         * the message once its avatar is loaded, which can take several seconds after the first
-         * frame. Every attempt re-reads the notification, so a later post is picked up here long
-         * before the row would otherwise be rebound (expand / scroll).
-         */
-        val AVATAR_REFILL_DELAYS_MILLIS = longArrayOf(180L, 320L, 600L, 1200L, 2000L, 3000L)
-
-        /**
-         * Header icon box used when neither the host's own resolver nor the layout has an answer —
-         * 40dp is the size the ColorOS 17 headers compose their avatars into at every density.
-         */
-        const val FALLBACK_CONTENT_SIZE_DP = 40f
     }
 }

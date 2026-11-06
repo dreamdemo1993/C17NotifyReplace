@@ -170,7 +170,7 @@ internal object HostAvatarPresence {
             }
         val cacheKey = sbn.key + "#" + System.identityHashCode(largeIcon)
         avatarDecisions.get(cacheKey)?.let { return it.forRowType(summary).settled(avatarLess) }
-        val verdict = runCatching { judge(context, sbn.packageName, largeIcon) }
+        val verdict = runCatching { judge(context, sbn.packageName, largeIcon, avatarSampleKey(sbn)) }
             .getOrElse {
                 if (summary) {
                     Verdict(renderable = false, reason = REASON_GROUP_SUMMARY)
@@ -244,14 +244,21 @@ internal object HostAvatarPresence {
      * large icon is a binder round trip plus a bitmap decode — the exact shape of the game-assistant
      * jank. Keyed by notification key *and* post time so a re-post (which is how the photo arrives)
      * is sampled afresh.
+     *
+     * [judge] fills this cache with the pixels it already had to sample, which is what keeps the
+     * guard from decoding the same `content://` URI a second time on the main thread for a row that
+     * was just evaluated: the two used to run back to back on every new post.
      */
     private fun avatarSample(context: Context, sbn: StatusBarNotification): IntArray? {
-        val cacheKey = sbn.key + "#" + sbn.postTime
+        val cacheKey = avatarSampleKey(sbn)
         return avatarSamples.get(cacheKey)
             ?: avatarDrawable(context, sbn)?.let { sample(it) }?.also {
                 avatarSamples.put(cacheKey, it)
             }
     }
+
+    /** One key for [avatarSamples], so a sample written by [judge] is found by [avatarSample]. */
+    private fun avatarSampleKey(sbn: StatusBarNotification): String = sbn.key + "#" + sbn.postTime
 
     /**
      * Whether two drawables are, visually, the same picture.
@@ -331,13 +338,13 @@ internal object HostAvatarPresence {
 
     /**
      * Whether [drawable] carries the host's layered composition *shape*, regardless of what it
-     * wrapped — i.e. "ColorOS has already answered for this row".
+     * wrapped — i.e. "ColorOS has already painted a layered picture for this row".
      *
-     * Used by the probe ladder to stop waiting: once a layered picture is in the slot, the host has
-     * finished its composition for this post, so a picture that is still the app glyph means it had
-     * nothing else to wrap. Waiting out the rest of the window only keeps the bare icon on screen
-     * (report: 「微信通知成原生图标了」). A photo that shows up later arrives as a re-post and is
-     * judged afresh anyway.
+     * The probe ladder only uses this to decide whether its first pass has anything left to wait
+     * for; it deliberately does **not** end the wait. A composition can still be a placeholder —
+     * the host builds "app icon + badge" while the sender photo is being loaded — so treating the
+     * shape as a final answer is what demoted WeChat's first message after a reboot to the themed
+     * icon (re.12.4).
      */
     fun hasHostCompositionShape(drawable: Drawable?): Boolean =
         drawable != null && hasCompositionTypeName(drawable)
@@ -450,6 +457,8 @@ internal object HostAvatarPresence {
         context: Context,
         packageName: String,
         largeIcon: Icon,
+        /** Where the sampled pixels go, so the draw-time checks never decode this icon again. */
+        sampleKey: String,
     ): Verdict {
         // A large icon that points at the app's own resources is the app's brand artwork, not a
         // contact photo. Banking and utility apps post their launcher art there (Bank of China's
@@ -476,6 +485,10 @@ internal object HostAvatarPresence {
         // themed icon instead. Sampled once and reused for the launcher comparison below.
         val avatarPixels = sample(avatar)
             ?: return Verdict(renderable = true, reason = "sample-failed")
+        // Hand the pixels to the draw-time checks. Without this the header guard decodes the same
+        // `content://` large icon again — a binder call plus a bitmap decode — on the main thread,
+        // in addition to the work just done here, for every row that enters a guard.
+        avatarSamples.put(sampleKey, avatarPixels)
         if (isBlankPixels(avatarPixels)) {
             // Also provisional: a flat sheet is what a cold app posts before its photo is ready.
             return Verdict(renderable = false, reason = REASON_BLANK_ARTWORK, provisional = true)
