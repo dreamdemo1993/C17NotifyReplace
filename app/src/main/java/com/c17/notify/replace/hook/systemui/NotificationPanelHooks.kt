@@ -877,6 +877,7 @@ internal class NotificationPanelHooks(
                                     "key" to rowSbn.key,
                                     "verdict" to verdict.reason,
                                     "size" to (prefillSize ?: 0).toString(),
+                                    "source" to HostAvatarComposition.lastSource,
                                 ),
                                 occurrence = OccurrencePolicy.Once("header_badge_prefill:${rowSbn.key}"),
                             )
