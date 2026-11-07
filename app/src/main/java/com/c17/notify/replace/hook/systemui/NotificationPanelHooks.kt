@@ -2234,9 +2234,37 @@ internal class NotificationPanelHooks(
                 // came; it re-checks on every draw, so this ladder is done.
                 if (headerPlaceholderGuards[icon] != null) return@postDelayed
                 // The row may have been re-used for another notification while we waited.
-                val currentKey = runCatching { row?.let { statusBarNotificationFromRow(it) }?.key }
+                val latest = runCatching { row?.let { statusBarNotificationFromRow(it) } }
                     .getOrNull()
-                if (currentKey != null && currentKey != sbn.key) return@postDelayed
+                if (latest != null && latest.key != sbn.key) return@postDelayed
+                // Re-read the notification on every pass instead of trusting the copy captured at
+                // bind time. WeChat attaches the sender photo by **re-posting the same key**, and
+                // SystemUI can update the entry without rebinding the row — so a verdict computed at
+                // bind time keeps saying `no-large-icon` for the whole window while the photo has
+                // been sitting in the notification for seconds, and the last pass demotes a row that
+                // would otherwise have shown 「头像 + 角标」 (report: 「护理官这个通知从原生跳成
+                // 主题图标 没加载出来个人头像」). Evaluating is cheap: the pixel comparison behind it
+                // is cached per `key#postTime`, and a notification without a large icon answers from
+                // its extras alone.
+                val observed = latest ?: sbn
+                val reread = HostAvatarPresence.evaluate(icon.context, observed)
+                if (reread.renderable && !reread.provisional) {
+                    diagnostics.report(
+                        level = DiagnosticLevel.Debug,
+                        event = DiagnosticEvent.HostAvatarYield,
+                        message = "角标诊断：${sbn.packageName} 重新读到头像（${reread.reason}），" +
+                            "让给宿主",
+                        attributes = mapOf(
+                            "package" to sbn.packageName,
+                            "key" to sbn.key,
+                            "pass" to index.toString(),
+                            "verdict" to reread.reason,
+                            "difference" to reread.difference.toString(),
+                        ),
+                        occurrence = OccurrencePolicy.Once("host_avatar_late:${sbn.key}"),
+                    )
+                    return@postDelayed
+                }
                 val current = icon.drawable ?: return@postDelayed
                 // Whether the slot already holds a layered picture. Only used to decide whether
                 // pass 0 has anything left to wait for — it must not shorten the window: see the
@@ -2330,6 +2358,50 @@ internal class NotificationPanelHooks(
                     snapshot = snapshot,
                     force = true,
                 )
+                // Giving up is not final any more. The guard watches the *slot*, so it can hand the
+                // row back once the host composes an avatar — but it cannot see a photo that only
+                // arrives in the notification after this window closed, and the app's re-post is not
+                // bounded by our ladder. Ask the notification once more after a longer silence and
+                // undo the demotion if the picture showed up: leaving the row on the theme icon for
+                // the rest of the session is exactly the failure users describe as 「没加载出来个人
+                // 头像」. One extra evaluation on a cached verdict, so the cost is a no-op for a row
+                // that really has no avatar.
+                val demotedKey = sbn.key
+                val rowView = row as? View
+                val rowWrapper = members.expandableRowGetViewWrapper
+                if (rowView != null && rowWrapper != null) {
+                    rowView.postDelayed(avatarUndo@{
+                        try {
+                            if (!configuration.isCurrent(snapshot)) return@avatarUndo
+                            if (!icon.isAttachedToWindow) return@avatarUndo
+                            // A later pass already took the slot back; nothing to undo.
+                            if (headerPlaceholderGuards[icon] == null) return@avatarUndo
+                            val nowSbn = runCatching {
+                                statusBarNotificationFromRow(rowView)
+                            }.getOrNull() ?: return@avatarUndo
+                            if (nowSbn.key != demotedKey) return@avatarUndo
+                            val again = HostAvatarPresence.evaluate(icon.context, nowSbn)
+                            if (!again.renderable || again.provisional) return@avatarUndo
+                            headerPlaceholderGuards.remove(icon)?.stop()
+                            diagnostics.report(
+                                level = DiagnosticLevel.Info,
+                                event = DiagnosticEvent.HostAvatarReplace,
+                                message = "角标诊断：${sbn.packageName} 降级后通知补上了头像" +
+                                    "（${again.reason}），撤销主题图标交回宿主",
+                                attributes = mapOf(
+                                    "package" to sbn.packageName,
+                                    "key" to demotedKey,
+                                    "verdict" to again.reason,
+                                    "difference" to again.difference.toString(),
+                                ),
+                                occurrence = OccurrencePolicy.Once("host_avatar_undo:$demotedKey"),
+                            )
+                            reapplyRowIcon(rowView, rowWrapper)
+                        } catch (throwable: Throwable) {
+                            reportCallbackFailure("panel:avatar_undo", throwable)
+                        }
+                    }, AVATAR_DEMOTE_RECHECK_MILLIS)
+                }
                 } catch (throwable: Throwable) {
                     reportCallbackFailure("panel:avatar_probe", throwable)
                 }
@@ -2928,11 +3000,27 @@ internal class NotificationPanelHooks(
          * while the row was between two of the host's own compositions, and the fallback pinned the
          * theme icon on a notification that did have a photo.
          *
-         * Five passes over ten seconds: the early ones only observe (and remember whatever the host
-         * composed), the later ones retry the local composition, and the very last one is the only
-         * place allowed to give up.
+         * Seven passes over eighteen seconds: the early ones only observe (and remember whatever
+         * the host composed), and the very last one is the only place allowed to give up.
+         *
+         * Ten seconds used to be the whole window, on the theory that WeChat re-posts a message
+         * about nine seconds after the sender photo is written. It is a *typical* delay, not a
+         * bound: a 服务号 push had its `largeIcon` one second after the post, while a 微信小店/
+         * 客服 message sat at `no-large-icon` for the full ten seconds and was demoted to the theme
+         * icon while its photo was still loading (report: 「护理官这个通知从原生跳成主题图标
+         * 没加载出来个人头像」). The extra passes cost nothing when the host answers early — the
+         * ladder returns on the first pass that finds a composition — so the window only matters
+         * for rows that really have nothing.
          */
-        val HOST_AVATAR_GRACE_MILLIS = longArrayOf(700L, 1600L, 3000L, 6000L, 10_000L)
+        val HOST_AVATAR_GRACE_MILLIS = longArrayOf(
+            700L,
+            1600L,
+            3000L,
+            6000L,
+            10_000L,
+            14_000L,
+            18_000L,
+        )
 
         /**
          * The same ladder for a notification the host has already had its chance at.
@@ -2953,6 +3041,18 @@ internal class NotificationPanelHooks(
          * the full grace window to apply. Covers WeChat's re-post (about 9 s) plus slack.
          */
         const val HOST_FRESH_POST_MILLIS = 12_000L
+
+        /**
+         * How long after a demotion to look at the notification one last time.
+         *
+         * The ladder bounds how long the host gets *before* the row is replaced, but not how long
+         * the app may take to attach the sender photo: a 微信 服务号/客服 message was still at
+         * `no-large-icon` after ten seconds and got the theme icon while its picture was loading
+         * (report: 「护理官这个通知从原生跳成主题图标 没加载出来个人头像」). The re-check costs one
+         * cached verdict read and only ever *removes* a guard, so a late photo is picked up without
+         * making the common case any slower.
+         */
+        const val AVATAR_DEMOTE_RECHECK_MILLIS = 15_000L
 
         /**
          * How late a pass may arrive and still count as evidence about the slot.
