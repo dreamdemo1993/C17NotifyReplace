@@ -160,6 +160,13 @@ internal class NotificationPanelHooks(
      * replaced and the lock-screen hero kept the stock icon. These hooks cover exactly that form;
      * they only ever run while `shouldShowPublic()` is true, so the normal avatar composition in
      * the notification shade can never be touched by them.
+     *
+     * The same callback also marks the way *back*: on unlock the row leaves the public form without
+     * being rebound, and everything the module wrote lived in the public layout's icon view. Nothing
+     * was watching the private header icon, so the notification centre showed the host's bare
+     * `smallIcon` for every notification that had arrived while the phone was locked (report:
+     * 「又有原生图标出现了」, WeChat + weather + 京东, all posted 34–50 min earlier to a locked
+     * phone). Leaving the public form therefore re-runs the normal panel path.
      */
     private fun installHiddenContentHooks() {
         val setHideSensitive = members.rowSetHideSensitive ?: return
@@ -169,6 +176,9 @@ internal class NotificationPanelHooks(
                 // The public layout is (re)inflated right after this call, so run once now and
                 // again after the next frames — the icon may not exist on the first pass yet.
                 applyHiddenContentIcon(row)
+                if (!isShowingPublicLayout(row)) {
+                    reapplyAfterLeavingPublicForm(row)
+                }
                 (row as? View)?.let { view ->
                     val snapshot = configuration.snapshot
                     view.post {
@@ -184,6 +194,35 @@ internal class NotificationPanelHooks(
             }
             result
         }
+    }
+
+    /**
+     * True while the row is rendering its redacted layout. When the host cannot answer, the row is
+     * treated as private: writing the theme icon there is the harmless case, keeping a native icon
+     * is not.
+     */
+    private fun isShowingPublicLayout(row: Any): Boolean = runCatching {
+        members.rowShouldShowPublic?.invoke(row) as? Boolean
+    }.getOrNull() == true
+
+    /**
+     * Re-runs the ordinary header path after the row stops showing its public form.
+     *
+     * Nothing else looks at the row at that moment — the public layout's icon was the one that got
+     * the theme icon, and no rebind follows an unlock — so without this the row keeps the host's
+     * raw app icon for the rest of the session. Three passes because the host re-inflates the
+     * private header asynchronously, exactly like a fresh bind.
+     */
+    private fun reapplyAfterLeavingPublicForm(row: Any) {
+        val view = row as? View ?: return
+        val rowWrapper = members.expandableRowGetViewWrapper ?: return
+        val snapshot = configuration.snapshot
+        reapplyRowIcon(view, rowWrapper)
+        view.post { if (configuration.isCurrent(snapshot)) reapplyRowIcon(view, rowWrapper) }
+        view.postDelayed(
+            { if (configuration.isCurrent(snapshot)) reapplyRowIcon(view, rowWrapper) },
+            PANEL_RETRY_DELAY_MILLIS,
+        )
     }
 
     /**
@@ -405,6 +444,17 @@ internal class NotificationPanelHooks(
 
     @Volatile
     private var lastStackSweepAt = 0L
+
+    /**
+     * When this SystemUI process installed the panel hooks.
+     *
+     * A notification restored after a reboot carries its original (old) `postTime`, but in *this*
+     * process the host has not composed anything yet — its first composition still takes a second or
+     * two. Treating "old postTime" as "the host already had its chance" would then pin the theme
+     * icon over the avatar of the very first message after a reboot, which is the report this whole
+     * ladder exists to prevent. So a young process always keeps the full window.
+     */
+    private val hooksInstalledAt = SystemClock.elapsedRealtime()
 
     private fun reportChildrenHookMissing(onViewAdded: Method?, stackOnViewAdded: Method?) {
         diagnostics.memberMissing(
@@ -2056,6 +2106,20 @@ internal class NotificationPanelHooks(
     }
 
     /**
+     * Whether ColorOS could still be composing this row's avatar right now.
+     *
+     * True while the notification is new (the app may re-post with the photo, WeChat takes ~9 s) or
+     * while this process is young (a cold SystemUI has to start the app before it can read anything).
+     * False means the host has had its chance: whatever is in the slot is its final answer, so the
+     * row may be demoted as soon as the first pass confirms it still holds a bare glyph.
+     */
+    private fun isFreshForHost(sbn: StatusBarNotification): Boolean {
+        val sincePost = System.currentTimeMillis() - sbn.postTime
+        if (sincePost in 0..HOST_FRESH_POST_MILLIS) return true
+        return SystemClock.elapsedRealtime() - hooksInstalledAt < HOST_FRESH_POST_MILLIS
+    }
+
+    /**
      * Arms the themed-icon guard after actually looking at the slot, instead of trusting the
      * prediction that the host will paint a contact photo there.
      *
@@ -2072,7 +2136,8 @@ internal class NotificationPanelHooks(
      * is only meaningful when the host has *never* produced a composition for this row. The ladder
      * in [HOST_AVATAR_GRACE_MILLIS] therefore does three things in order: remember every composition
      * it sees, restore that composition when the host repaints over it, and only arm the themed-icon
-     * guard when ten seconds pass without a single composition.
+     * guard when ten seconds pass without a single composition — or, for a notification the host has
+     * already had minutes to answer, after [SETTLED_AVATAR_LADDER_MILLIS].
      */
     private fun guardHeaderIfHostSkipsAvatar(
         icon: ImageView,
@@ -2100,6 +2165,12 @@ internal class NotificationPanelHooks(
             verdict.renderable && !verdict.provisional -> HOST_AVATAR_GRACE_MILLIS
             HostAvatarPackages.contains(icon.context, sbn.packageName) -> HOST_AVATAR_GRACE_MILLIS
             else -> PLACEHOLDER_PROBE_MILLIS
+        }.let { full ->
+            // The long window only buys anything while the host may still be working on this post.
+            // For a row that was posted minutes ago in a process that has been up for hours, the
+            // host's answer either already landed or never will: waiting the full ten seconds only
+            // leaves the bare app icon on screen after the user pulls the shade down.
+            if (isFreshForHost(sbn)) full else SETTLED_AVATAR_LADDER_MILLIS
         }
         // What the host managed to compose for this row during the window. ColorOS repaints the
         // slot with the bare glyph between its own compositions (a rebind, a regroup, a sibling
@@ -2849,6 +2920,26 @@ internal class NotificationPanelHooks(
          * place allowed to give up.
          */
         val HOST_AVATAR_GRACE_MILLIS = longArrayOf(700L, 1600L, 3000L, 6000L, 10_000L)
+
+        /**
+         * The same ladder for a notification the host has already had its chance at.
+         *
+         * Ten seconds exist for the sequence right after a post: WeChat writes the message first
+         * and the sender photo up to nine seconds later, and a cold SystemUI still has to start the
+         * app's process. None of that is pending for a row that was posted minutes ago — if ColorOS
+         * were going to compose an avatar for it, it did so the first time the row was shown. Waiting
+         * the full window there is what made a notification centre pulled down at 07:50 still show
+         * the bare app icons of notifications from 07:00 (report: 「又有原生图标出现了」, three rows,
+         * all posted while the phone was locked). A row that is still on its raw glyph 2.5 s after
+         * the user is actually looking at it is not going to get one.
+         */
+        val SETTLED_AVATAR_LADDER_MILLIS = longArrayOf(400L, 1200L, 2500L)
+
+        /**
+         * How recently a notification must have arrived — or this process must have started — for
+         * the full grace window to apply. Covers WeChat's re-post (about 9 s) plus slack.
+         */
+        const val HOST_FRESH_POST_MILLIS = 12_000L
 
         /**
          * How late a pass may arrive and still count as evidence about the slot.
