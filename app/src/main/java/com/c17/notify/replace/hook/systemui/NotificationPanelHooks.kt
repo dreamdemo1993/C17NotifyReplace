@@ -223,6 +223,19 @@ internal class NotificationPanelHooks(
             { if (configuration.isCurrent(snapshot)) reapplyRowIcon(view, rowWrapper) },
             PANEL_RETRY_DELAY_MILLIS,
         )
+        // One line per half minute: the only question this has to answer in a log is whether
+        // `setHideSensitive` is the callback ColorOS actually uses for the unlock transition, and
+        // if it is not, every row that arrived on the lock screen stays native with no trace at all.
+        diagnostics.report(
+            level = DiagnosticLevel.Debug,
+            event = DiagnosticEvent.IconReapplied,
+            message = "行离开隐藏通知内容形态，按普通路径重铺 header 图标",
+            attributes = mapOf(
+                "row" to (row.javaClass.simpleName),
+                "revision" to snapshot.revision,
+            ),
+            occurrence = OccurrencePolicy.RateLimited("panel:leave_public_form", 30_000L),
+        )
     }
 
     /**
