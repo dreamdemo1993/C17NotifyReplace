@@ -134,13 +134,17 @@ internal class NotificationIconResolver(
             )
             null
         } ?: return composeMiss(sbn, "头像源图解码失败")
-        return HostAvatarComposition.compose(
+        val attempt = HostAvatarComposition.compose(
             context = context,
             avatar = avatar,
             badge = badge,
             packageName = sbn.packageName,
             contentSizePx = contentSizePx,
-        ) ?: composeMiss(sbn, "宿主合成函数不可用或抛异常")
+        )
+        return attempt.drawable ?: composeMiss(
+            sbn,
+            attempt.failure ?: "宿主合成函数没有返回图片",
+        )
     }
 
     /**
@@ -220,6 +224,13 @@ internal class NotificationIconResolver(
         context: Context,
         sbn: StatusBarNotification,
         originalSmallIcon: Icon?,
+        /**
+         * Resolve the themed icon even for a row that would normally yield to the host avatar.
+         * Only the panel passes `true`, and only after it has looked at the notification itself and
+         * found that there is no photo to compose from: such a row must not sit on the raw app icon
+         * while a timer waits for a composition that cannot come.
+         */
+        ignoreHostAvatar: Boolean = false,
     ): PanelIconRenderPlan? = resolveOrFallback("panel", "通知面板图标解析失败") {
         // ColorOS renders the "personal avatar + app-icon badge" composition itself for the picked
         // packages. Leave those rows, banner cards and lock-screen capsules untouched — but only
@@ -227,7 +238,7 @@ internal class NotificationIconResolver(
         // Rule for the shade: a row with a sender photo keeps "avatar + themed badge" only while
         // it stands on its own. The aggregated row ("[2条] …") is always the themed app icon,
         // even when the aggregate ships a photo of its own, so it must not yield here.
-        if (!HostAvatarPresence.isGroupSummary(sbn) &&
+        if (!ignoreHostAvatar && !HostAvatarPresence.isGroupSummary(sbn) &&
             shouldYieldToHostAvatar(context, sbn.packageName, sbn)
         ) return@resolveOrFallback null
         if (

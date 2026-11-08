@@ -1704,11 +1704,69 @@ internal class NotificationPanelHooks(
                     if (verdict.renderable || verdict.provisional) {
                         headerPlaceholderGuards.remove(icon)?.stop()
                     }
-                    // plan is null here only when the theme engine itself failed (a yield would
-                    // have produced a replacement plan for every no-avatar row since 5.4). The
-                    // guard stays as the cold-start net: it resolves the themed icon lazily and
-                    // forces redraws until the engine is warm, then takes the slot from the
-                    // app-icon placeholder the host painted in the meantime.
+                    // A row with **nothing to compose from** does not wait at all. The ladder below
+                    // is armed on this `CachedIconView`, and on the lock screen the host rebuilds
+                    // those rows: the deferred passes then run against a view nobody displays, or
+                    // are dropped by the `isAttachedToWindow` / `isCurrent` guards, and the row keeps
+                    // the bare glyph for as long as the notification lives. The 15:00 report is
+                    // exactly that — `先让宿主画几拍再决定` at 15:00:38.509, then *no* demotion at all,
+                    // while the screenshot at 15:00:44 still shows the green WeChat icon; the avatar
+                    // only arrived at 15:01:47 when the app finally re-posted with the photo.
+                    //
+                    // So the themed icon goes in now and the slot is watched afterwards: the guard
+                    // hands the row straight back to the host the moment it composes a picture, and
+                    // [armAvatarUndoRecheck] re-asks the notification once the app has had time to
+                    // attach a photo. A photo that is already there keeps the old behaviour — see
+                    // [guardHeaderIfHostSkipsAvatar] — because there the wait can still pay off.
+                    if (!verdict.renderable) {
+                        val immediate = snapshot.resolver.resolvePanelIconPlan(
+                            context = icon.context,
+                            sbn = sbn,
+                            originalSmallIcon = sbn.originalSmallIcon(diagnostics, snapshot.revision),
+                            ignoreHostAvatar = true,
+                        )
+                        if (immediate != null) {
+                            val previous = icon.drawable
+                            icon.applyRenderPlan(immediate, PanelIconTarget.Header)
+                            icon.drawable?.let { drawable ->
+                                headerIconClaims.claim(icon, sbn.key, drawable)
+                            }
+                            guardHeaderIconAgainstHostPlaceholder(
+                                icon = icon,
+                                row = row,
+                                sbn = sbn,
+                                snapshot = snapshot,
+                                plan = immediate,
+                                hostArtwork = previous,
+                            )
+                            armAvatarUndoRecheck(icon, row, sbn, snapshot)
+                            diagnostics.report(
+                                level = DiagnosticLevel.Debug,
+                                event = DiagnosticEvent.HostAvatarReplace,
+                                message = "角标诊断：${sbn.packageName} 通知里没有可用的头像" +
+                                    "（${verdict.reason}），直接铺主题图标，宿主画出头像再让路",
+                                attributes = mapOf(
+                                    "package" to sbn.packageName,
+                                    "key" to sbn.key,
+                                    "verdict" to verdict.reason,
+                                    "provisional" to verdict.provisional.toString(),
+                                ),
+                                occurrence = OccurrencePolicy.Once(
+                                    "panel:immediate_theme:${sbn.key}",
+                                ),
+                            )
+                            // Nothing left to wait for: the slot holds the themed icon and the
+                            // guard owns it from here. Arming the ladder as well would only let it
+                            // mistake that write for a host composition.
+                            return
+                        }
+                    }
+                    // Everything that is left here either carries a photo (so the host still has a
+                    // chance to compose it) or could not be resolved to a themed icon at all. The
+                    // ladder watches the slot in the first case and acts as the cold-start net in
+                    // the second: it resolves the theme icon lazily and forces redraws until the
+                    // engine is warm, then takes the slot from the app-icon placeholder the host
+                    // painted in the meantime.
                     //
                     // [canRenderAvatar] is a *prediction*; when it says "photo" the guard installs
                     // late instead of not at all, so a host that never paints the photo cannot
@@ -2475,47 +2533,62 @@ internal class NotificationPanelHooks(
                 // the rest of the session is exactly the failure users describe as 「没加载出来个人
                 // 头像」. One extra evaluation on a cached verdict, so the cost is a no-op for a row
                 // that really has no avatar.
-                val demotedKey = sbn.key
-                val rowView = row as? View
-                val rowWrapper = members.expandableRowGetViewWrapper
-                if (rowView != null && rowWrapper != null) {
-                    rowView.postDelayed(avatarUndo@{
-                        try {
-                            if (!configuration.isCurrent(snapshot)) return@avatarUndo
-                            if (!icon.isAttachedToWindow) return@avatarUndo
-                            // A later pass already took the slot back; nothing to undo.
-                            if (headerPlaceholderGuards[icon] == null) return@avatarUndo
-                            val nowSbn = runCatching {
-                                statusBarNotificationFromRow(rowView)
-                            }.getOrNull() ?: return@avatarUndo
-                            if (nowSbn.key != demotedKey) return@avatarUndo
-                            val again = HostAvatarPresence.evaluate(icon.context, nowSbn)
-                            if (!again.renderable || again.provisional) return@avatarUndo
-                            headerPlaceholderGuards.remove(icon)?.stop()
-                            diagnostics.report(
-                                level = DiagnosticLevel.Info,
-                                event = DiagnosticEvent.HostAvatarReplace,
-                                message = "角标诊断：${sbn.packageName} 降级后通知补上了头像" +
-                                    "（${again.reason}），撤销主题图标交回宿主",
-                                attributes = mapOf(
-                                    "package" to sbn.packageName,
-                                    "key" to demotedKey,
-                                    "verdict" to again.reason,
-                                    "difference" to again.difference.toString(),
-                                ),
-                                occurrence = OccurrencePolicy.Once("host_avatar_undo:$demotedKey"),
-                            )
-                            reapplyRowIcon(rowView, rowWrapper)
-                        } catch (throwable: Throwable) {
-                            reportCallbackFailure("panel:avatar_undo", throwable)
-                        }
-                    }, AVATAR_DEMOTE_RECHECK_MILLIS)
-                }
+                armAvatarUndoRecheck(icon, row, sbn, snapshot)
                 } catch (throwable: Throwable) {
                     reportCallbackFailure("panel:avatar_probe", throwable)
                 }
             }, delay)
         }
+    }
+
+    /**
+     * Asks the row's notification once more, later, whether a sender photo showed up.
+     *
+     * Both places that put the themed icon on a row without waiting — the immediate write for a
+     * notification that carries no photo, and the ladder's demotion — need the same way back. The
+     * guard can only react to what the host *paints*; a photo that arrives in the notification
+     * without a rebind and without a composition would otherwise leave the row themed for the rest
+     * of the session, which users report as 「没加载出来个人头像」.
+     */
+    private fun armAvatarUndoRecheck(
+        icon: ImageView,
+        row: Any?,
+        sbn: StatusBarNotification,
+        snapshot: RuntimeSnapshot,
+    ) {
+        val rowView = row as? View ?: return
+        val rowWrapper = members.expandableRowGetViewWrapper ?: return
+        rowView.postDelayed(avatarUndo@{
+            try {
+                if (!configuration.isCurrent(snapshot)) return@avatarUndo
+                if (!icon.isAttachedToWindow) return@avatarUndo
+                // A later pass already took the slot back; nothing to undo.
+                if (headerPlaceholderGuards[icon] == null) return@avatarUndo
+                val nowSbn = runCatching {
+                    statusBarNotificationFromRow(rowView)
+                }.getOrNull() ?: return@avatarUndo
+                if (nowSbn.key != sbn.key) return@avatarUndo
+                val again = HostAvatarPresence.evaluate(icon.context, nowSbn)
+                if (!again.renderable || again.provisional) return@avatarUndo
+                headerPlaceholderGuards.remove(icon)?.stop()
+                diagnostics.report(
+                    level = DiagnosticLevel.Info,
+                    event = DiagnosticEvent.HostAvatarReplace,
+                    message = "角标诊断：${sbn.packageName} 降级后通知补上了头像" +
+                        "（${again.reason}），撤销主题图标交回宿主",
+                    attributes = mapOf(
+                        "package" to sbn.packageName,
+                        "key" to sbn.key,
+                        "verdict" to again.reason,
+                        "difference" to again.difference.toString(),
+                    ),
+                    occurrence = OccurrencePolicy.Once("host_avatar_undo:${sbn.key}"),
+                )
+                reapplyRowIcon(rowView, rowWrapper)
+            } catch (throwable: Throwable) {
+                reportCallbackFailure("panel:avatar_undo", throwable)
+            }
+        }, AVATAR_DEMOTE_RECHECK_MILLIS)
     }
 
     /**

@@ -42,10 +42,11 @@ internal object HostAvatarComposition {
      * module only chooses the **arguments** — the sender photo and the themed app icon for the
      * badge.
      *
-     * Returns null when the helper is missing or throws. There is deliberately no local fallback:
-     * both earlier attempts at painting this picture ourselves produced the wrong silhouette
-     * (「头像形状切割的很奇怪」, then 「连带角标都被裁剪了 恢复原生通知的形状」), and a caller that
-     * gets null keeps whatever the host put in the slot instead of inventing a shape.
+     * Returns an [Attempt] that is either the picture or the reason there is none. There is
+     * deliberately no local fallback: both earlier attempts at painting this picture ourselves
+     * produced the wrong silhouette (「头像形状切割的很奇怪」, then 「连带角标都被裁剪了 恢复原生
+     * 通知的形状」), and a caller that gets no picture keeps whatever the host put in the slot
+     * instead of inventing a shape.
      */
     fun compose(
         context: Context,
@@ -53,29 +54,69 @@ internal object HostAvatarComposition {
         badge: Drawable,
         packageName: String,
         contentSizePx: Int,
-    ): Drawable? = try {
-        resolve(context)
-            ?.invoke(null, context, avatar, badge, packageName, contentSizePx) as? Drawable
-    } catch (throwable: Throwable) {
-        null
+    ): Attempt {
+        val method = resolve(context)
+            ?: return Attempt(null, "找不到 $HELPER_CLASS#$HELPER_METHOD")
+        return try {
+            val result = method.invoke(null, context, avatar, badge, packageName, contentSizePx)
+            if (result is Drawable) {
+                Attempt(result, null)
+            } else {
+                Attempt(null, "合成函数返回 ${result?.javaClass?.name ?: "null"}")
+            }
+        } catch (throwable: Throwable) {
+            val cause = (throwable as? java.lang.reflect.InvocationTargetException)?.targetException
+                ?: throwable
+            Attempt(null, "合成函数抛异常 ${cause.javaClass.simpleName}: ${cause.message}")
+        }
     }
+
+    /**
+     * What the host answered: a picture, or the reason it could not produce one.
+     *
+     * The caller can only act on "no picture", but the log has to tell a missing helper (renamed by
+     * ColorOS, or absent on this build) apart from a helper that exists and throws — those need
+     * different fixes.
+     */
+    internal class Attempt(val drawable: Drawable?, val failure: String?)
 
     private fun resolve(context: Context): Method? {
         helper?.let { return it }
-        return try {
+        val helperClass = try {
             Class.forName(HELPER_CLASS, false, context.classLoader)
-                .getDeclaredMethod(
+        } catch (throwable: Throwable) {
+            return null
+        }
+        // `contentSizePx` is an `Integer` in the Kotlin signature but the JVM sees whichever the
+        // host compiler chose, so both the boxed and the primitive form have to be tried. When
+        // neither matches (a renamed or reshaped build), fall back to the argument *shape*: the
+        // function is the only one on that class taking (Context, Drawable, Drawable, String, int).
+        val candidates = listOfNotNull(
+            Integer::class.java,
+            Int::class.javaPrimitiveType,
+        )
+        val resolved = candidates.firstNotNullOfOrNull { sizeType ->
+            runCatching {
+                helperClass.getDeclaredMethod(
                     HELPER_METHOD,
                     Context::class.java,
                     Drawable::class.java,
                     Drawable::class.java,
                     String::class.java,
-                    Integer::class.java,
+                    sizeType,
                 )
-                .apply { isAccessible = true }
-                .also { helper = it }
-        } catch (throwable: Throwable) {
-            null
+            }.getOrNull()
+        } ?: helperClass.declaredMethods.firstOrNull { method ->
+            val types = method.parameterTypes
+            types.size == 5 &&
+                types[0].isAssignableFrom(context.javaClass) &&
+                types[1].isAssignableFrom(Drawable::class.java) &&
+                types[2].isAssignableFrom(Drawable::class.java) &&
+                types[3].isAssignableFrom(String::class.java) &&
+                (types[4] == Int::class.javaPrimitiveType ||
+                    types[4] == Integer::class.java ||
+                    types[4] == Number::class.java)
         }
+        return resolved?.apply { isAccessible = true }?.also { helper = it }
     }
 }
