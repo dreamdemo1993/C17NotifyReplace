@@ -32,6 +32,34 @@ internal object HostAvatarComposition {
      */
     fun method(context: Context): Method? = resolve(context)
 
+    /**
+     * Draws the composition with the host's own helper — mask, corner badge and all.
+     *
+     * Needed when ColorOS decides *not* to compose a picture for a row that does carry a sender
+     * photo: it only builds "avatar + badge" for senders it recognises as people, so a personal
+     * WeChat message can sit on the bare green glyph indefinitely (report: 「这是个人微信啊 我肯定
+     * 要头像啊」). Calling the host's function keeps every pixel of geometry with the host; the
+     * module only chooses the **arguments** — the sender photo and the themed app icon for the
+     * badge.
+     *
+     * Returns null when the helper is missing or throws. There is deliberately no local fallback:
+     * both earlier attempts at painting this picture ourselves produced the wrong silhouette
+     * (「头像形状切割的很奇怪」, then 「连带角标都被裁剪了 恢复原生通知的形状」), and a caller that
+     * gets null keeps whatever the host put in the slot instead of inventing a shape.
+     */
+    fun compose(
+        context: Context,
+        avatar: Drawable,
+        badge: Drawable,
+        packageName: String,
+        contentSizePx: Int,
+    ): Drawable? = try {
+        resolve(context)
+            ?.invoke(null, context, avatar, badge, packageName, contentSizePx) as? Drawable
+    } catch (throwable: Throwable) {
+        null
+    }
+
     private fun resolve(context: Context): Method? {
         helper?.let { return it }
         return try {

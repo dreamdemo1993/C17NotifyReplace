@@ -91,6 +91,50 @@ internal class NotificationIconResolver(
         NotificationIconPolicy.shouldResolveTheme(policyConfig, IconSurface.Panel)
 
     /**
+     * Builds the "avatar + badge" picture with the host's own composer.
+     *
+     * Only for the case ColorOS leaves open: a row that carries a real sender photo but never gets
+     * a composition, because the host only builds one for senders it classifies as people. A
+     * personal WeChat message is the one that matters — it sat on the bare green glyph for a whole
+     * session in `_diag_20261108_1118` (report: 「这是个人微信啊 我肯定要头像啊」).
+     *
+     * Nothing is drawn here. [HostAvatarComposition.compose] invokes the host's
+     * `createBackgroundWithAppIcon`, so the mask, the badge size and its placement are exactly the
+     * stock ones; this method only chooses the arguments — the sender photo from the notification
+     * and the **themed** app icon as the badge, which is the module's rule for these rows.
+     */
+    fun composeAvatarWithHost(
+        context: Context,
+        sbn: StatusBarNotification,
+        contentSizePx: Int,
+        allowGroupSummaryAvatar: Boolean = false,
+    ): Drawable? {
+        if (!configLoaded) return null
+        if (!NotificationIconPolicy.isAvatarPriorityPackage(policyConfig, sbn.packageName)) return null
+        if (!panelThemeIconsEnabled()) return null
+        if (!HostAvatarPresence.canRenderAvatar(context, sbn, allowGroupSummaryAvatar)) return null
+        val badge = resolvePanelThemeDrawable(context, sbn) ?: return null
+        val avatar = try {
+            HostAvatarPresence.avatarDrawable(context, sbn)
+        } catch (exception: Throwable) {
+            diagnostics.runtimeFailure(
+                scope = "icon_resolver:host_avatar_compose",
+                message = "合成头像时解码源图失败，保留宿主原图标",
+                cause = exception,
+                revision = revision,
+            )
+            null
+        } ?: return null
+        return HostAvatarComposition.compose(
+            context = context,
+            avatar = avatar,
+            badge = badge,
+            packageName = sbn.packageName,
+            contentSizePx = contentSizePx,
+        )
+    }
+
+    /**
      * Desktop theme icon as an [Icon] for the lock-screen capsule, which carries both an [Icon] and a
      * [Drawable] slot and therefore cannot use [resolvePanelThemeDrawable] alone.
      */
