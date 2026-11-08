@@ -2411,29 +2411,42 @@ internal class NotificationPanelHooks(
                         occurrence = OccurrencePolicy.Once("host_avatar_compose_miss:${sbn.key}"),
                     )
                 }
-                // Demoting here is irrevocable in practice — the guard installed below makes every
-                // later pass return at the `guards[icon] != null` check — and it strips both the
-                // avatar and the badge, so only the **last** pass may do it.
+                // When this row may give up and take the themed icon. The wait is *not* the same
+                // for the two kinds of row, because only one of them still has something to gain
+                // from waiting:
                 //
-                // Nothing shortens that wait, in particular not a layered picture in the slot. That
-                // used to be read as "ColorOS has answered for this post, stop waiting" (re.12.4),
-                // but the answer can be a placeholder: WeChat's first message after a reboot carries
-                // no `largeIcon` of its own, so the host composes "app icon + badge" straight away
-                // and paints the sender photo from its contact store only seconds later. Every row
-                // that reaches this point is `provisional` — the verdict itself says the artwork has
-                // not been committed to yet — so it gets the whole window regardless of what type is
-                // currently in the slot.
+                // * The notification carries no photo at all (`provisional` — WeChat posted it from
+                //   a cold process, before the sender picture existed). Nothing in the extras can be
+                //   composed into an avatar, so the only thing the long window buys is a *re-post*
+                //   with a photo, and a re-post rebinds the row on its own. Meanwhile the row sits
+                //   on the bare glyph for eighteen seconds — which is exactly what the user sees as
+                //   「重启后 原生图标 … 重启 systemui 后 原生图标」: the 13:02 report showed the same
+                //   WeChat aggregate painted raw on every cold SystemUI start and only turning
+                //   themed 18 s later. It may therefore demote at the first pass past
+                //   [PROVISIONAL_DEMOTE_AFTER_MILLIS].
+                // * The notification *does* carry a photo, ColorOS simply has not composed it yet.
+                //   There the wait is still worth something: [composeHeaderAvatar] retries on every
+                //   pass with the host's own composer, and a cold theme engine answers null for the
+                //   first seconds after a restart. Those rows keep the full window and only give up
+                //   on the last pass.
                 //
-                // A `largeIcon` in the notification does not shorten it either. ColorOS only
-                // composes "avatar + badge" for senders it recognises as people: a service account
-                // or a group announcement carries a picture and still gets the bare small icon, and
-                // giving up on its behalf pinned that glyph to the row for good (report: 「重启后首条
-                // 又是原生图标」). The slot is the only thing that answers "did the host paint it".
-                if (index < ladder.lastIndex) return@postDelayed
+                // Demotion is no longer irreversible either, which is what makes the early gate
+                // safe: the guard installed below hands the slot back the moment the host paints a
+                // composition, and [AVATAR_DEMOTE_RECHECK_MILLIS] re-asks the notification in case
+                // the photo arrives without a rebind.
+                // The gate reads [carriesPhoto] — what *this* pass just saw — rather than the verdict
+                // captured at bind time: a re-post that lands mid-ladder must not be demoted on the
+                // strength of a stale "no photo" answer.
+                val mayDemote = if (carriesPhoto) {
+                    index >= ladder.lastIndex
+                } else {
+                    delay >= PROVISIONAL_DEMOTE_AFTER_MILLIS
+                }
+                if (!mayDemote) return@postDelayed
                 diagnostics.report(
                     level = DiagnosticLevel.Info,
                     event = DiagnosticEvent.HostAvatarReplace,
-                    message = "角标诊断：${sbn.packageName} 到最后一拍头像位仍是原样图标" +
+                    message = "角标诊断：${sbn.packageName} 等了 ${delay}ms 头像位仍是原样图标" +
                         "（${currentReason}），改用主题图标",
                     attributes = mapOf(
                         "package" to sbn.packageName,
@@ -3219,6 +3232,24 @@ internal class NotificationPanelHooks(
          * making the common case any slower.
          */
         const val AVATAR_DEMOTE_RECHECK_MILLIS = 15_000L
+
+        /**
+         * When a row whose notification carries **no** photo may stop waiting for the host.
+         *
+         * Such a row has nothing to compose from: no `largeIcon`, no `Person`, no messaging style.
+         * The host answers it with the bare glyph and keeps answering that until the app re-posts
+         * with the sender picture — and a re-post rebinds the row anyway. Holding the full
+         * eighteen-second window on that guess is what put the raw icon on screen after every
+         * reboot and every SystemUI restart (report: 「重启后 原生图标 锁屏解锁后主题图标 重启
+         * systemui 后 原生图标」, all three screenshots were this one WeChat aggregate waiting out
+         * the ladder).
+         *
+         * 1600 ms is the second pass: every host composition ever logged landed on pass 0 (700 ms),
+         * so a row ColorOS really does paint an avatar for still shows that picture without a
+         * themed icon flashing first, while a row it ignores turns themed one beat later instead of
+         * eighteen seconds later. The guard and the re-check below keep both outcomes reversible.
+         */
+        const val PROVISIONAL_DEMOTE_AFTER_MILLIS = 1_600L
 
         /**
          * How late a pass may arrive and still count as evidence about the slot.

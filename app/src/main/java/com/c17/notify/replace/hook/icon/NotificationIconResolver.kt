@@ -109,11 +109,20 @@ internal class NotificationIconResolver(
         contentSizePx: Int,
         allowGroupSummaryAvatar: Boolean = false,
     ): Drawable? {
-        if (!configLoaded) return null
-        if (!NotificationIconPolicy.isAvatarPriorityPackage(policyConfig, sbn.packageName)) return null
-        if (!panelThemeIconsEnabled()) return null
-        if (!HostAvatarPresence.canRenderAvatar(context, sbn, allowGroupSummaryAvatar)) return null
-        val badge = resolvePanelThemeDrawable(context, sbn) ?: return null
+        // Every refusal is logged with its own wording. The caller only ever sees null, and "no
+        // composition happened" is not an answer: on 2026-11-08 12:58 a row that did carry a photo
+        // (contact-photo, difference 68.36) still produced a composition miss, and a single
+        // catch-all message could not tell a cold theme engine from a missing photo.
+        if (!configLoaded) return composeMiss(sbn, "配置还没加载完")
+        if (!NotificationIconPolicy.isAvatarPriorityPackage(policyConfig, sbn.packageName)) {
+            return composeMiss(sbn, "该应用没勾选显示个人头像")
+        }
+        if (!panelThemeIconsEnabled()) return composeMiss(sbn, "面板主题图标已关闭")
+        if (!HostAvatarPresence.canRenderAvatar(context, sbn, allowGroupSummaryAvatar)) {
+            return composeMiss(sbn, "通知里没有可用的头像")
+        }
+        val badge = resolvePanelThemeDrawable(context, sbn)
+            ?: return composeMiss(sbn, "取不到该应用的主题图标")
         val avatar = try {
             HostAvatarPresence.avatarDrawable(context, sbn)
         } catch (exception: Throwable) {
@@ -124,14 +133,33 @@ internal class NotificationIconResolver(
                 revision = revision,
             )
             null
-        } ?: return null
+        } ?: return composeMiss(sbn, "头像源图解码失败")
         return HostAvatarComposition.compose(
             context = context,
             avatar = avatar,
             badge = badge,
             packageName = sbn.packageName,
             contentSizePx = contentSizePx,
+        ) ?: composeMiss(sbn, "宿主合成函数不可用或抛异常")
+    }
+
+    /**
+     * One line per notification explaining why the host's composer was not used. Rate-limited per
+     * key so a ladder that retries the composition on every pass only says it once.
+     */
+    private fun composeMiss(sbn: StatusBarNotification, reason: String): Drawable? {
+        diagnostics.report(
+            level = DiagnosticLevel.Debug,
+            event = DiagnosticEvent.HostAvatarYield,
+            message = "角标诊断：${sbn.packageName} 没能合成头像（$reason）",
+            attributes = mapOf(
+                "package" to sbn.packageName,
+                "key" to sbn.key,
+                "reason" to reason,
+            ),
+            occurrence = OccurrencePolicy.Once("host_avatar_compose_reason:${sbn.key}"),
         )
+        return null
     }
 
     /**
