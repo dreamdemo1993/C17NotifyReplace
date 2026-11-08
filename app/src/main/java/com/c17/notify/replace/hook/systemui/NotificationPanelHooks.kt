@@ -54,6 +54,22 @@ internal class NotificationPanelHooks(
      */
     private val headerBadgeRow = ThreadLocal<StatusBarNotification?>()
 
+    /**
+     * The `OplusNotificationHeaderViewWrapperExImp` behind each header wrapper, plus the boolean it
+     * passes to `updateIconRoundness` — recorded by [installOplusHeaderRoundnessReapply].
+     *
+     * `updateIconRoundness` is the host's own entry into "avatar + badge": it asks
+     * `NotificationIconBadgePackages.contains(pkg)`, looks the composition up in the header cache,
+     * schedules the asynchronous pass when there is none, and applies the result. Re-running it is
+     * therefore the cheapest way to make the host retry a row it left on the raw app icon — no
+     * module-drawn picture involved. Weak keys so dismissed rows do not pin their wrappers.
+     */
+    private val oplusExtensions =
+        java.util.Collections.synchronizedMap(java.util.WeakHashMap<Any, OplusExtensionBinding>())
+
+    /** Keys already covered by the retrigger ladder, so re-entrant binds do not stack new ones. */
+    private val avatarRetriggers = ConcurrentHashMap<String, Long>()
+
     /** `OplusNotificationHeaderViewWrapperExImp.resolveHeaderIconContentSizePx()`, resolved once. */
     @Volatile
     private var contentSizeMethod: Method? = null
@@ -65,6 +81,9 @@ internal class NotificationPanelHooks(
      */
     @Volatile
     private var lastHeaderContentSizePx = 0
+
+    /** See [oplusExtensions]: the host extender and the argument its bind used. */
+    private class OplusExtensionBinding(val extension: Any, val roundness: Boolean)
 
     fun install() {
         installOplusHeaderHooks()
@@ -701,7 +720,24 @@ internal class NotificationPanelHooks(
                 )
                 false
             }
-            if (!allowed) return@install original
+            if (!allowed) {
+                // Either the package really is not in the host's list, or the setting has not been
+                // written yet. Both are answers the module must respect — recorded because a
+                // "first message after reboot" report cannot be told apart from a "gate is
+                // somewhere else" one without them.
+                diagnostics.report(
+                    level = DiagnosticLevel.Debug,
+                    event = DiagnosticEvent.HostAvatarYield,
+                    message = "角标诊断：$packageName 宿主判定不在头像包列表，" +
+                        "系统设置里也没有（保持宿主原判定）",
+                    attributes = mapOf("package" to packageName),
+                    occurrence = OccurrencePolicy.RateLimited(
+                        "badge_packages_declined:$packageName",
+                        5_000L,
+                    ),
+                )
+                return@install original
+            }
             diagnostics.report(
                 level = DiagnosticLevel.Info,
                 event = DiagnosticEvent.HostAvatarYield,
@@ -1602,6 +1638,7 @@ internal class NotificationPanelHooks(
         val method = oplusHeader.updateIconRoundness ?: return
         hooks.install(method, "systemui.panel.header.updateIconRoundness") { chain ->
             val extension = chain.instanceOrNull
+            val roundnessArgument = chain.args.firstOrNull { it is Boolean } as? Boolean ?: true
             val wrapper = extension?.let { instance ->
                 try {
                     oplusHeader.getBase.invoke(instance)
@@ -1617,7 +1654,29 @@ internal class NotificationPanelHooks(
             }
             // Within a few bytecodes the host asks for this very row's badge drawable
             // (`...getHeaderIconBadgeDrawable(key|pkg)`), so the row is recorded for that lookup.
-            wrapper?.let(::statusBarNotificationOfWrapper)?.let { rowSbn -> headerBadgeRow.set(rowSbn) }
+            val rowSbn = wrapper?.let(::statusBarNotificationOfWrapper)
+            if (wrapper != null && extension != null) {
+                // Remembered so a row the host left on its raw icon can be handed back to the same
+                // host method later — see [armHostAvatarRetrigger].
+                oplusExtensions[wrapper] = OplusExtensionBinding(extension, roundnessArgument)
+            }
+            rowSbn?.let(headerBadgeRow::set)
+            if (rowSbn != null) {
+                diagnostics.report(
+                    level = DiagnosticLevel.Debug,
+                    event = DiagnosticEvent.HostAvatarYield,
+                    message = "角标诊断：${rowSbn.packageName} 宿主开始圆角/合成图标" +
+                        "（roundness=$roundnessArgument）",
+                    attributes = mapOf(
+                        "package" to rowSbn.packageName,
+                        "key" to rowSbn.key,
+                    ),
+                    occurrence = OccurrencePolicy.RateLimited(
+                        "panel:roundness_entry:${rowSbn.packageName}",
+                        1_000L,
+                    ),
+                )
+            }
             val result = try {
                 chain.proceed()
             } finally {
@@ -1643,6 +1702,103 @@ internal class NotificationPanelHooks(
     private fun statusBarNotificationOfWrapper(wrapper: Any): StatusBarNotification? =
         runCatching { members.notificationViewWrapperRow.get(wrapper) }.getOrNull()
             ?.let(::statusBarNotificationFromRow)
+
+    /** True when the slot holds a picture the host composed, not the app's own icon. */
+    private fun isHostComposedIcon(drawable: Drawable?): Boolean =
+        drawable != null && drawable.javaClass.name.contains("DrawableWithBadge")
+
+    /**
+     * True when the slot already shows something the host stands behind — its "avatar + badge"
+     * composition, an avatar, or anything that is not the bare app glyph. Such a row never needs
+     * another host pass, and re-running `updateIconRoundness` on it would repaint the raw icon for
+     * a frame.
+     */
+    private fun slotHoldsHostArtwork(icon: ImageView, sbn: StatusBarNotification): Boolean {
+        val shown = icon.drawable ?: return false
+        if (isHostComposedIcon(shown)) return true
+        return !runCatching { looksLikeRawIcon(icon.context, sbn, shown) }.getOrDefault(false)
+    }
+
+    /**
+     * Re-runs the host's own avatar pass for a row it left on the bare app icon.
+     *
+     * After a reboot the host registers `NotificationIconBadgePackages` (the observer behind
+     * `Settings.Global systemui_icon_badge_packages`) *asynchronously*, and
+     * `updateIconRoundness` gives up entirely when `contains(package)` says false. The first
+     * message of every conversation then keeps the raw icon, while the second one — a few seconds
+     * later, once the list has loaded — composes normally (reports 2026-11-08 20:29 and 21:01).
+     *
+     * Rather than predicting when the observer is ready, the row is re-offered to
+     * `updateIconRoundness` a few times: that method is the host's own entry into "avatar + badge"
+     * (it re-checks the package list, looks the composition up in its cache, schedules the async
+     * pass, applies and caches the result). The module never draws anything here — if the host
+     * declines, the row keeps exactly what the stock build would show.
+     *
+     * The ladder stops as soon as the slot holds a host composition, and never stacks: the key is
+     * claimed before the first beat and only released by the last one (or by an answer).
+     */
+    private fun armHostAvatarRetrigger(
+        rowView: View,
+        icon: ImageView,
+        wrapper: Any,
+        sbn: StatusBarNotification,
+        snapshot: RuntimeSnapshot,
+    ) {
+        if (slotHoldsHostArtwork(icon, sbn)) return
+        val key = sbn.key
+        if (avatarRetriggers.putIfAbsent(key, snapshot.revision) != null) return
+        HOST_AVATAR_RETRIGGER_MILLIS.forEachIndexed { index, delay ->
+            val last = index == HOST_AVATAR_RETRIGGER_MILLIS.lastIndex
+            rowView.postDelayed(retrigger@{
+                try {
+                    if (!configuration.isCurrent(snapshot)) return@retrigger
+                    if (!icon.isAttachedToWindow) return@retrigger
+                    val current = runCatching { statusBarNotificationFromRow(rowView) }.getOrNull()
+                        ?: return@retrigger
+                    if (current.key != key) return@retrigger
+                    // Only a slot that still shows the bare glyph is worth another host pass:
+                    // re-running the method writes the raw icon first, so asking on a row that
+                    // already has its picture would flash it away for a frame.
+                    if (slotHoldsHostArtwork(icon, sbn)) {
+                        avatarRetriggers.remove(key)
+                        return@retrigger
+                    }
+                    val binding = oplusExtensions[wrapper]
+                    val update = members.oplusHeader?.updateIconRoundness
+                    if (binding == null || update == null) {
+                        if (last) {
+                            avatarRetriggers.remove(key)
+                            diagnostics.report(
+                                level = DiagnosticLevel.Warning,
+                                event = DiagnosticEvent.MemberMissing,
+                                message = "角标诊断：${sbn.packageName} 找不到宿主 header 扩展，" +
+                                    "无法让宿主重试头像合成",
+                                attributes = mapOf("package" to sbn.packageName, "key" to key),
+                                occurrence = OccurrencePolicy.Once("panel:avatar_retrigger_missing:$key"),
+                            )
+                        }
+                        return@retrigger
+                    }
+                    diagnostics.report(
+                        level = DiagnosticLevel.Info,
+                        event = DiagnosticEvent.HostAvatarYield,
+                        message = "角标诊断：${sbn.packageName} 头像位仍是原样图标，" +
+                            "第 ${index + 1} 次请宿主重跑合成（roundness=${binding.roundness}）",
+                        attributes = mapOf(
+                            "package" to sbn.packageName,
+                            "key" to key,
+                            "attempt" to (index + 1).toString(),
+                        ),
+                        occurrence = OccurrencePolicy.Once("panel:avatar_retrigger:$key:$index"),
+                    )
+                    update.invoke(binding.extension, binding.roundness)
+                    if (last) avatarRetriggers.remove(key)
+                } catch (throwable: Throwable) {
+                    reportCallbackFailure("panel:avatar_retrigger", throwable)
+                }
+            }, delay)
+        }
+    }
 
     private fun applyPanelIcon(
         wrapper: Any,
@@ -1752,6 +1908,16 @@ internal class NotificationPanelHooks(
                         ),
                         occurrence = OccurrencePolicy.Once("panel:native_avatar:${sbn.key}"),
                     )
+                    // Right after a reboot the host's own pass can come back empty-handed: its
+                    // `NotificationIconBadgePackages` observer (data:
+                    // `Settings.Global systemui_icon_badge_packages`) is registered late, and
+                    // `contains(pkg)` answering false skips the whole composition — every first
+                    // message of a conversation stays on the raw app icon until the app posts
+                    // again (reports 2026-11-08 20:29 / 21:01, where the *second* message of the
+                    // same conversation composed normally). Nothing in the module can compose that
+                    // picture — and nothing should try — so the row is simply handed back to the
+                    // same host method once the cold-start window has passed.
+                    rowView?.let { armHostAvatarRetrigger(it, icon, wrapper, sbn, snapshot) }
                     return
                 }
                 // Yielding to the host avatar. ColorOS composes that avatar asynchronously on its
@@ -3350,6 +3516,21 @@ internal class NotificationPanelHooks(
          * working on — the failure users see as 「从原生跳成主题图标 没加载出来个人头像」.
          */
         val SETTLED_AVATAR_LADDER_MILLIS = longArrayOf(400L, 1200L, 2500L, 4000L, 6000L)
+
+        /**
+         * When to ask the host to run its own avatar pass again on a row it left on the raw icon.
+         *
+         * `NotificationIconBadgePackages` — the gate `updateIconRoundness` opens with — is an
+         * observer over `Settings.Global systemui_icon_badge_packages`, registered asynchronously.
+         * Right after a reboot it is still empty, so the first message of every conversation gets
+         * no composition at all, while the second one (tens of seconds later) composes fine. The
+         * measured landings: post at +45 s drew nothing, post at +64 s composed.
+         *
+         * The beats therefore straddle that window instead of guessing one moment: 4 s, 12 s, 25 s
+         * and 40 s after the row yielded. Each is a single reflection call into the host's own
+         * method — cheap, idempotent, and powerless if the host still refuses.
+         */
+        val HOST_AVATAR_RETRIGGER_MILLIS = longArrayOf(4_000L, 12_000L, 25_000L, 40_000L)
 
         /**
          * Header icon box used when neither the host's own resolver nor the layout has an answer —
