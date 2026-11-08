@@ -71,6 +71,7 @@ internal class NotificationPanelHooks(
         installHostCompositionHook()
         installGroupIconManagerHooks()
         installPackageIconResolverHooks()
+        installBadgePackagesColdStartBridge()
         installPackageIconByNameHooks()
         installHiddenContentHooks()
         installChildrenContainerHooks()
@@ -663,6 +664,52 @@ internal class NotificationPanelHooks(
                 occurrence = OccurrencePolicy.Once("package_icon_replaced:$packageName"),
             )
             replacement
+        }
+    }
+
+    /**
+     * Bridges the host's cold `NotificationIconBadgePackages` observer across boot.
+     *
+     * Every "avatar + badge" composition is gated on `contains(packageName)`; the gate is answered
+     * from the host's in-memory copy of the `systemui_icon_badge_packages` setting, which its
+     * observer loads asynchronously. The first bind of a conversation lands inside that window
+     * right after a reboot (report: 「重启后 任何人的第一条消息 没有头像 原生图标 第二条恢复」,
+     * 2026-11-08 20:29 — the badge hook was never even reached because the gate said false), and
+     * the row keeps its raw icon until the next bind.
+     *
+     * When the original answers false, the same setting is read directly. A package that is in the
+     * setting can only have been refused because the observer has not loaded yet — once it has,
+     * the original returns true on its own and this bridge goes dormant. Nothing is invented: the
+     * package list is the host's own data, the composition that follows is the host's own code.
+     */
+    private fun installBadgePackagesColdStartBridge() {
+        val method = members.badgePackagesContains ?: return
+        hooks.install(method, "systemui.panel.badgePackagesColdStart") { chain ->
+            val original = chain.proceed()
+            if (original == true) return@install original
+            val packageName = chain.args.firstOrNull { it is String } as? String
+            if (packageName.isNullOrEmpty()) return@install original
+            val context = systemUiContext() ?: return@install original
+            val allowed = try {
+                HostAvatarPackages.contains(context, packageName)
+            } catch (throwable: Throwable) {
+                diagnostics.runtimeFailure(
+                    scope = "panel:badge_packages_bridge",
+                    message = "角标诊断：$packageName 读取宿主包列表设置失败，交回原判定",
+                    cause = throwable,
+                    revision = configuration.snapshot.revision,
+                )
+                false
+            }
+            if (!allowed) return@install original
+            diagnostics.report(
+                level = DiagnosticLevel.Info,
+                event = DiagnosticEvent.HostAvatarYield,
+                message = "角标诊断：$packageName 宿主角标包列表尚未加载完成，按系统设置放行头像合成",
+                attributes = mapOf("package" to packageName),
+                occurrence = OccurrencePolicy.Once("badge_packages_cold:$packageName"),
+            )
+            true
         }
     }
 

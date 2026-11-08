@@ -111,6 +111,12 @@ internal data class PanelMembers(
     val rowGetPublicLayout: Method?,
     /** `ExpandableNotificationRow.setHideSensitive(...)` — fires when the switch flips. */
     val rowSetHideSensitive: Method?,
+    /**
+     * `NotificationIconBadgePackages.contains(String)` — the host consults it before every
+     * "avatar + badge" composition. `null` on builds without the class; the cold-start bridge
+     * hook simply does not install then.
+     */
+    val badgePackagesContains: Method?,
 )
 
 internal data class PackageIconResolverMembers(
@@ -641,6 +647,21 @@ internal object SystemUiMembers {
             }
         }
 
+        val badgePackagesContains = loadOptional(NOTIFICATION_ICON_BADGE_PACKAGES, classLoader)?.let { cls ->
+            Reflection.findMethodReturning(
+                cls,
+                "contains",
+                Boolean::class.javaPrimitiveType!!,
+                String::class.java,
+            )?.apply { isAccessible = true }
+        }
+        if (badgePackagesContains == null) {
+            diagnostics.memberMissing(
+                scope = "systemui:panel:badge_packages",
+                message = "未找到 NotificationIconBadgePackages.contains，重启后首条通知无法桥接宿主包列表冷启动",
+            )
+        }
+
         return PanelMembers(
             notificationEntryGetSbn = notificationEntryGetSbn,
             notificationViewWrapperRow = notificationViewWrapperRow,
@@ -670,6 +691,7 @@ internal object SystemUiMembers {
             rowGetPublicLayout = rowGetPublicLayout,
             rowSetHideSensitive = rowSetHideSensitive,
             packageIconResolver = resolvePackageIconResolver(classLoader, diagnostics),
+            badgePackagesContains = badgePackagesContains,
         )
     }
 
@@ -1449,6 +1471,11 @@ internal object SystemUiMembers {
     private const val CACHING_ICON_VIEW = "com.android.internal.widget.CachingIconView"
     private const val OPLUS_HEADER_EXTENSION =
         "com.oplus.systemui.statusbar.notification.row.wrapper.OplusNotificationHeaderViewWrapperExImp"
+    // The host's own copy of the `systemui_icon_badge_packages` setting. Its observer loads
+    // asynchronously; until then contains() answers false and updateIconRoundness skips the whole
+    // "avatar + badge" composition — the first message after a reboot keeps the raw icon.
+    private const val NOTIFICATION_ICON_BADGE_PACKAGES =
+        "com.oplus.systemui.notification.NotificationIconBadgePackages"
     private const val VIEW_CONFIG_COORDINATOR =
         "com.android.systemui.statusbar.notification.collection.coordinator.ViewConfigCoordinator"
     private const val NOTIF_PIPELINE =
