@@ -1671,9 +1671,12 @@ internal class NotificationPanelHooks(
                         "package" to rowSbn.packageName,
                         "key" to rowSbn.key,
                     ),
+                    // 15 s, not 1 s: a notification with a live timer re-runs this method every two
+                    // seconds for hours, and at one line per second it drowned every other line of
+                    // the report the user sends back (2026-11-09 07:20–07:43).
                     occurrence = OccurrencePolicy.RateLimited(
                         "panel:roundness_entry:${rowSbn.packageName}",
-                        1_000L,
+                        15_000L,
                     ),
                 )
             }
@@ -1778,6 +1781,61 @@ internal class NotificationPanelHooks(
                             )
                         }
                         return@retrigger
+                    }
+                    // Re-running the host method only helps while its own gate is the blocker.
+                    // On 2026-11-09 07:24 it was not: the first WeChat message of the day kept the
+                    // bare green glyph for five and a half minutes, all four beats returned
+                    // `roundness=false` and changed nothing, and the avatar only appeared when a
+                    // later rebind re-ran the host's composition. So from the second beat on the
+                    // picture is built with the host's own composer instead of asking again: the
+                    // sender photo comes from the notification, the badge is the themed app icon —
+                    // the same two arguments SystemUI passes itself, every pixel of geometry still
+                    // the host's. A miss writes nothing at all, so the row keeps exactly what the
+                    // stock build shows.
+                    if (index >= HOST_AVATAR_COMPOSE_BEAT) {
+                        val previous = icon.drawable
+                        val composed = composeHeaderAvatar(icon, wrapper, current, snapshot)
+                        if (composed != null) {
+                            icon.clearColorFilter()
+                            icon.imageTintList = null
+                            icon.setImageDrawable(composed)
+                            diagnostics.report(
+                                level = DiagnosticLevel.Info,
+                                event = DiagnosticEvent.HostAvatarReplace,
+                                message = "角标诊断：${sbn.packageName} 宿主几拍都没合成头像，" +
+                                    "改用宿主自己的合成函数补上（头像+主题角标）",
+                                attributes = mapOf(
+                                    "package" to sbn.packageName,
+                                    "key" to key,
+                                    "attempt" to (index + 1).toString(),
+                                ),
+                                occurrence = OccurrencePolicy.Once(
+                                    "panel:avatar_retrigger_compose:$key",
+                                ),
+                            )
+                            // The composition is the module's write, not the host's, so it needs the
+                            // same guard the themed path installs: a sibling arriving or a shade
+                            // re-layout makes the host repaint the row from its own cache, which puts
+                            // the bare glyph back. The guard recognises this very instance and holds
+                            // it, and stands down for anything the host composes itself.
+                            headerPlaceholderGuards.put(
+                                icon,
+                                HeaderPlaceholderGuard(
+                                    icon = icon,
+                                    row = rowView,
+                                    sbn = current,
+                                    snapshot = snapshot,
+                                    plan = NotificationIconResolver.PanelIconRenderPlan(
+                                        composed,
+                                        null,
+                                    ),
+                                    hostArtwork = previous,
+                                ),
+                            )?.stop()
+                            headerPlaceholderGuards[icon]?.start()
+                            avatarRetriggers.remove(key)
+                            return@retrigger
+                        }
                     }
                     diagnostics.report(
                         level = DiagnosticLevel.Info,
@@ -3066,6 +3124,11 @@ internal class NotificationPanelHooks(
                 ?: return true
             val current = icon.drawable ?: return true
             if (current === themedNow) return true
+            // A "avatar + badge" picture this guard wrote itself (built with the host's composer
+            // from the notification's photo) is not the host taking the slot back: hold it, or the
+            // host's next cache repaint — a sibling arriving, a shade re-layout — drops the row
+            // straight back to the bare glyph.
+            if (plan?.drawable != null && current === plan.drawable) return true
             val now = SystemClock.uptimeMillis()
             // Rate-limit first: identifying the artwork samples two bitmaps, and a host that keeps
             // repainting every frame must not turn that into per-frame work.
@@ -3531,6 +3594,18 @@ internal class NotificationPanelHooks(
          * method — cheap, idempotent, and powerless if the host still refuses.
          */
         val HOST_AVATAR_RETRIGGER_MILLIS = longArrayOf(4_000L, 12_000L, 25_000L, 40_000L)
+
+        /**
+         * First beat of [HOST_AVATAR_RETRIGGER_MILLIS] that also composes the picture itself.
+         *
+         * The first beat is reserved for the host: on the platform these rows exist for, the
+         * host's own asynchronous pass is usually in flight by then and wins legitimately. From the
+         * second beat on (12 s) a row that still shows the bare glyph is not "waiting for the
+         * observer any more" — the host has answered twice and produced nothing (2026-11-09
+         * 07:24: four beats, five and a half minutes of the raw WeChat icon), so the host's own
+         * composer is used with the notification's photo and the themed app icon.
+         */
+        const val HOST_AVATAR_COMPOSE_BEAT = 1
 
         /**
          * Header icon box used when neither the host's own resolver nor the layout has an answer —
