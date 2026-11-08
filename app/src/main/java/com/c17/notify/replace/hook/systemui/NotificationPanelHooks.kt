@@ -2195,6 +2195,10 @@ internal class NotificationPanelHooks(
         // seconds later — deciding "宿主没画" and forcing the theme icon, so the row that *had* a
         // photo was left with no avatar at all.
         var hostArtwork: Drawable? = null
+        // What the notification itself says, refreshed on every pass. The verdict computed at bind
+        // time is stale the moment the app re-posts with a picture attached, and the log line that
+        // records a demotion has to name what the last pass actually saw.
+        var currentReason = verdict.reason
         // When the ladder was armed. Posted on the view, so the system may freeze it for minutes
         // (screen off, doze) and fire a late pass against a slot that has been rebound since —
         // see the overrun check inside the lambda.
@@ -2248,12 +2252,20 @@ internal class NotificationPanelHooks(
                 // its extras alone.
                 val observed = latest ?: sbn
                 val reread = HostAvatarPresence.evaluate(icon.context, observed)
+                currentReason = reread.reason
+                // A photo in the notification is **not** the same thing as a composition in the
+                // slot, and treating the former as an answer is what left rows on the bare icon for
+                // a whole session (report: 「重启后首条又是原生图标」, 2026-11-08 11:03 — WeChat
+                // re-posted the same key with a `largeIcon` at 11:05, this branch read
+                // `contact-photo`, every pass returned here, and the row never got an avatar
+                // because the host never composed one for it). Note the photo and carry on: only
+                // the slot can say whether ColorOS actually painted something.
                 if (reread.renderable && !reread.provisional) {
                     diagnostics.report(
                         level = DiagnosticLevel.Debug,
                         event = DiagnosticEvent.HostAvatarYield,
                         message = "角标诊断：${sbn.packageName} 重新读到头像（${reread.reason}），" +
-                            "让给宿主",
+                            "继续观察宿主是否合成",
                         attributes = mapOf(
                             "package" to sbn.packageName,
                             "key" to sbn.key,
@@ -2263,7 +2275,6 @@ internal class NotificationPanelHooks(
                         ),
                         occurrence = OccurrencePolicy.Once("host_avatar_late:${sbn.key}"),
                     )
-                    return@postDelayed
                 }
                 val current = icon.drawable ?: return@postDelayed
                 // Whether the slot already holds a layered picture. Only used to decide whether
@@ -2314,13 +2325,6 @@ internal class NotificationPanelHooks(
                 // thread away from the very work we are waiting for. A composition that already
                 // landed is the exception: there is nothing left to wait for on this pass.
                 if (index == 0 && !hostAnswered) return@postDelayed
-                // A row that is *known* to carry a contact photo is never demoted here. The themed
-                // icon covers both the avatar and the badge, so writing it is strictly worse than
-                // leaving whatever the host painted — and WeChat re-posts the notification once its
-                // picture is written, which re-enters this whole decision with the photo present.
-                // (Report: 「微信通知成原生图标了」 is the opposite failure; this branch is the one
-                // that produced 「第一条还是主题图标」.)
-                if (verdict.renderable && !verdict.provisional) return@postDelayed
                 // Demoting here is irrevocable in practice — the guard installed below makes every
                 // later pass return at the `guards[icon] != null` check — and it strips both the
                 // avatar and the badge, so only the **last** pass may do it.
@@ -2333,12 +2337,18 @@ internal class NotificationPanelHooks(
                 // that reaches this point is `provisional` — the verdict itself says the artwork has
                 // not been committed to yet — so it gets the whole window regardless of what type is
                 // currently in the slot.
+                //
+                // A `largeIcon` in the notification does not shorten it either. ColorOS only
+                // composes "avatar + badge" for senders it recognises as people: a service account
+                // or a group announcement carries a picture and still gets the bare small icon, and
+                // giving up on its behalf pinned that glyph to the row for good (report: 「重启后首条
+                // 又是原生图标」). The slot is the only thing that answers "did the host paint it".
                 if (index < ladder.lastIndex) return@postDelayed
                 diagnostics.report(
                     level = DiagnosticLevel.Info,
                     event = DiagnosticEvent.HostAvatarReplace,
                     message = "角标诊断：${sbn.packageName} 到最后一拍头像位仍是原样图标" +
-                        "（${verdict.reason}），改用主题图标",
+                        "（${currentReason}），改用主题图标",
                     attributes = mapOf(
                         "package" to sbn.packageName,
                         "key" to sbn.key,
@@ -3031,10 +3041,14 @@ internal class NotificationPanelHooks(
          * were going to compose an avatar for it, it did so the first time the row was shown. Waiting
          * the full window there is what made a notification centre pulled down at 07:50 still show
          * the bare app icons of notifications from 07:00 (report: 「又有原生图标出现了」, three rows,
-         * all posted while the phone was locked). A row that is still on its raw glyph 2.5 s after
-         * the user is actually looking at it is not going to get one.
+         * all posted while the phone was locked).
+         *
+         * Six seconds, not the 2.5 s this used to be: the row being *visible* is itself the trigger
+         * for the host's composition, and the first time the shade is pulled down the row may only
+         * now enter the window. Giving up at 2.5 s demoted a row whose avatar the host was still
+         * working on — the failure users see as 「从原生跳成主题图标 没加载出来个人头像」.
          */
-        val SETTLED_AVATAR_LADDER_MILLIS = longArrayOf(400L, 1200L, 2500L)
+        val SETTLED_AVATAR_LADDER_MILLIS = longArrayOf(400L, 1200L, 2500L, 4000L, 6000L)
 
         /**
          * How recently a notification must have arrived — or this process must have started — for
