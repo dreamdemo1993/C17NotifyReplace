@@ -1685,6 +1685,28 @@ internal class NotificationPanelHooks(
                 )
             }
             if (plan == null) {
+                if (target == PanelIconTarget.Header &&
+                    snapshot.resolver.shouldKeepNativePanelAvatar(sbn)
+                ) {
+                    // The host owns the whole personal-message row: sender lookup, avatar cache,
+                    // mask, asynchronous rebind and late photo. A guard left by an older bind must
+                    // not paint over it. The app icon is themed upstream in
+                    // getPackageIconForNotification, so the native composition gets the themed
+                    // corner badge without this class writing the ImageView at all.
+                    headerPlaceholderGuards.remove(icon)?.stop()
+                    diagnostics.report(
+                        level = DiagnosticLevel.Debug,
+                        event = DiagnosticEvent.HostAvatarYield,
+                        message = "角标诊断：${sbn.packageName} 个人消息交还 SystemUI 原生头像逻辑" +
+                            "，仅替换原生角标",
+                        attributes = mapOf(
+                            "package" to sbn.packageName,
+                            "key" to sbn.key,
+                        ),
+                        occurrence = OccurrencePolicy.Once("panel:native_avatar:${sbn.key}"),
+                    )
+                    return
+                }
                 // Yielding to the host avatar. ColorOS composes that avatar asynchronously on its
                 // own dispatcher, so the row paints the plain small icon (or an "app icon + badge"
                 // composition) for a moment first. That intermediate is the host's, and the module

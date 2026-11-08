@@ -232,15 +232,14 @@ internal class NotificationIconResolver(
          */
         ignoreHostAvatar: Boolean = false,
     ): PanelIconRenderPlan? = resolveOrFallback("panel", "通知面板图标解析失败") {
-        // ColorOS renders the "personal avatar + app-icon badge" composition itself for the picked
-        // packages. Leave those rows, banner cards and lock-screen capsules untouched — but only
-        // when this notification has an avatar for the host to compose (see the resolver method).
-        // Rule for the shade: a row with a sender photo keeps "avatar + themed badge" only while
-        // it stands on its own. The aggregated row ("[2条] …") is always the themed app icon,
-        // even when the aggregate ships a photo of its own, so it must not yield here.
-        if (!ignoreHostAvatar && !HostAvatarPresence.isGroupSummary(sbn) &&
-            shouldYieldToHostAvatar(context, sbn.packageName, sbn)
-        ) return@resolveOrFallback null
+        // A personal-message row belongs to SystemUI's own avatar pipeline from beginning to end.
+        // Do not predict the result from Notification.largeIcon: WeChat re-posts an existing key
+        // without it even after the host has already composed a photo for that key. The module's
+        // only write in this path is the app icon returned by getPackageIconForNotification, which
+        // the host uses as the corner badge. Aggregated and ongoing rows keep the normal icon rule.
+        if (!ignoreHostAvatar && shouldKeepNativePanelAvatar(sbn)) {
+            return@resolveOrFallback null
+        }
         if (
             !NotificationIconPolicy.shouldProcessPanel(
                 config = policyConfig,
@@ -444,6 +443,30 @@ internal class NotificationIconResolver(
             IconSurface.StatusBar,
             sbn.isOplusPush(),
         )
+
+    /**
+     * Whether the shade must leave this row's artwork entirely to SystemUI's native avatar logic.
+     *
+     * This is deliberately a row-type decision, not an avatar-presence guess. `largeIcon` is only
+     * one transient input to the host: WeChat can remove it on a later re-post of a conversation
+     * whose photo SystemUI has already cached. Replacing the whole row on that evidence destroys
+     * the native avatar (2026-11-08 20:07). The native `getPackageIconForNotification` hook still
+     * themes the corner badge, so the module changes the app icon and nothing else.
+     *
+     * Group summaries and ongoing/foreground-service rows are excluded: those follow the ordinary
+     * themed-app-icon rule rather than the personal-avatar rule.
+     */
+    fun shouldKeepNativePanelAvatar(sbn: StatusBarNotification): Boolean {
+        if (HostAvatarPresence.isGroupSummary(sbn)) return false
+        val flags = sbn.notification?.flags ?: 0
+        if ((flags and (Notification.FLAG_ONGOING_EVENT or Notification.FLAG_FOREGROUND_SERVICE)) != 0) {
+            return false
+        }
+        // An unloaded configuration is not an empty selection. Never overwrite a native avatar
+        // before the real package pick has arrived.
+        return !configLoaded ||
+            NotificationIconPolicy.isAvatarPriorityPackage(policyConfig, sbn.packageName)
+    }
 
     /**
      * True when the user picked this package for the personal avatar and ColorOS is going to render
