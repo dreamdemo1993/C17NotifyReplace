@@ -1954,29 +1954,62 @@ internal class NotificationPanelHooks(
                     // not paint over it. The app icon is themed upstream in
                     // getPackageIconForNotification, so the native composition gets the themed
                     // corner badge without this class writing the ImageView at all.
-                    headerPlaceholderGuards.remove(icon)?.stop()
+                    //
+                    // "Personal message" is a row *type*, not a promise that a photo exists. Right
+                    // after a reboot WeChat posts the first message of the day from a cold process,
+                    // often with no `largeIcon` at all and no re-post for another ten seconds
+                    // (2026-11-10 16:11: the row answered `no-large-icon` and sat on the bare green
+                    // glyph until 16:11:34, when an update finally carried the photo). Handing
+                    // *that* row to the host buys nothing but the stock app icon — the one thing
+                    // this module exists to replace. So the yield only happens when the
+                    // notification actually carries artwork; without it the row falls through to
+                    // the ordinary branch below, which paints the themed icon at once and gives the
+                    // slot back to the host the moment it composes a photo.
+                    val hostAvatar = HostAvatarPresence.evaluate(icon.context, sbn)
+                    if (hostAvatar.renderable || hostAvatar.provisional) {
+                        headerPlaceholderGuards.remove(icon)?.stop()
+                        diagnostics.report(
+                            level = DiagnosticLevel.Debug,
+                            event = DiagnosticEvent.HostAvatarYield,
+                            message = "角标诊断：${sbn.packageName} 个人消息交还 SystemUI 原生头像逻辑" +
+                                "，仅替换原生角标",
+                            attributes = mapOf(
+                                "package" to sbn.packageName,
+                                "key" to sbn.key,
+                                "verdict" to hostAvatar.reason,
+                                "provisional" to hostAvatar.provisional.toString(),
+                            ),
+                            occurrence = OccurrencePolicy.Once("panel:native_avatar:${sbn.key}"),
+                        )
+                        // Right after a reboot the host's own pass can come back empty-handed: its
+                        // `NotificationIconBadgePackages` observer (data:
+                        // `Settings.Global systemui_icon_badge_packages`) is registered late, and
+                        // `contains(pkg)` answering false skips the whole composition — every first
+                        // message of a conversation stays on the raw app icon until the app posts
+                        // again (reports 2026-11-08 20:29 / 21:01, where the *second* message of the
+                        // same conversation composed normally). The host is asked again on a ladder
+                        // and, from the second beat on, the picture is composed with the host's own
+                        // composer — see [armHostAvatarRetrigger].
+                        rowView?.let { armHostAvatarRetrigger(it, icon, wrapper, sbn, snapshot) }
+                        return
+                    }
+                    // A personal-message row with nothing to compose from would keep the bare app
+                    // icon for as long as the notification lives, and that is the one picture the
+                    // module must not leave on screen. Fall through to the ordinary branch below:
+                    // it paints the themed icon now, installs the guard, and hands the slot back to
+                    // the host as soon as a photo shows up in a later post.
                     diagnostics.report(
                         level = DiagnosticLevel.Debug,
                         event = DiagnosticEvent.HostAvatarYield,
-                        message = "角标诊断：${sbn.packageName} 个人消息交还 SystemUI 原生头像逻辑" +
-                            "，仅替换原生角标",
+                        message = "角标诊断：${sbn.packageName} 个人消息里没有头像素材" +
+                            "（${hostAvatar.reason}），按规则铺主题图标，宿主画出头像再让路",
                         attributes = mapOf(
                             "package" to sbn.packageName,
                             "key" to sbn.key,
+                            "verdict" to hostAvatar.reason,
                         ),
-                        occurrence = OccurrencePolicy.Once("panel:native_avatar:${sbn.key}"),
+                        occurrence = OccurrencePolicy.Once("panel:avatar_missing:${sbn.key}"),
                     )
-                    // Right after a reboot the host's own pass can come back empty-handed: its
-                    // `NotificationIconBadgePackages` observer (data:
-                    // `Settings.Global systemui_icon_badge_packages`) is registered late, and
-                    // `contains(pkg)` answering false skips the whole composition — every first
-                    // message of a conversation stays on the raw app icon until the app posts
-                    // again (reports 2026-11-08 20:29 / 21:01, where the *second* message of the
-                    // same conversation composed normally). Nothing in the module can compose that
-                    // picture — and nothing should try — so the row is simply handed back to the
-                    // same host method once the cold-start window has passed.
-                    rowView?.let { armHostAvatarRetrigger(it, icon, wrapper, sbn, snapshot) }
-                    return
                 }
                 // Yielding to the host avatar. ColorOS composes that avatar asynchronously on its
                 // own dispatcher, so the row paints the plain small icon (or an "app icon + badge"
@@ -3589,18 +3622,20 @@ internal class NotificationPanelHooks(
          * no composition at all, while the second one (tens of seconds later) composes fine. The
          * measured landings: post at +45 s drew nothing, post at +64 s composed.
          *
-         * The beats therefore straddle that window instead of guessing one moment: 4 s, 12 s, 25 s
-         * and 40 s after the row yielded. Each is a single reflection call into the host's own
-         * method — cheap, idempotent, and powerless if the host still refuses.
+         * The beats therefore straddle that window instead of guessing one moment: 2 s, 5 s, 10 s,
+         * 20 s and 40 s after the row yielded. Each is a single reflection call into the host's own
+         * method — cheap, idempotent, and powerless if the host still refuses. The first beats were
+         * moved earlier (were 4/12/25/40) so that a row the host can already compose stops showing
+         * the stock icon sooner.
          */
-        val HOST_AVATAR_RETRIGGER_MILLIS = longArrayOf(4_000L, 12_000L, 25_000L, 40_000L)
+        val HOST_AVATAR_RETRIGGER_MILLIS = longArrayOf(2_000L, 5_000L, 10_000L, 20_000L, 40_000L)
 
         /**
          * First beat of [HOST_AVATAR_RETRIGGER_MILLIS] that also composes the picture itself.
          *
          * The first beat is reserved for the host: on the platform these rows exist for, the
          * host's own asynchronous pass is usually in flight by then and wins legitimately. From the
-         * second beat on (12 s) a row that still shows the bare glyph is not "waiting for the
+         * second beat on (5 s) a row that still shows the bare glyph is not "waiting for the
          * observer any more" — the host has answered twice and produced nothing (2026-11-09
          * 07:24: four beats, five and a half minutes of the raw WeChat icon), so the host's own
          * composer is used with the notification's photo and the themed app icon.
