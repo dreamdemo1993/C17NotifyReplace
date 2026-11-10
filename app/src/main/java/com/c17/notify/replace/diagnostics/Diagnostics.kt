@@ -51,6 +51,7 @@ internal enum class DiagnosticEvent(val id: String) {
     SystemInfoReadFailed("system_info.read_failed"),
     SystemUiRestarted("systemui.restarted"),
     SystemUiRestartFailed("systemui.restart_failed"),
+    SystemUiHeapPressure("systemui.heap_pressure"),
 }
 
 internal sealed interface OccurrencePolicy {

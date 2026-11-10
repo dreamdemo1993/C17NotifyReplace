@@ -1749,6 +1749,10 @@ internal class NotificationPanelHooks(
     ) {
         if (slotHoldsHostArtwork(icon, sbn)) return
         val key = sbn.key
+        // A row that is detached mid-ladder never reaches its last beat, so its key would stay
+        // claimed for the rest of the session. Bounded rather than pruned by time: the entries are
+        // only alive for a minute at most, and dropping a live one at worst repeats a cheap call.
+        if (avatarRetriggers.size >= AVATAR_RETRIGGER_CAPACITY) avatarRetriggers.clear()
         if (avatarRetriggers.putIfAbsent(key, snapshot.revision) != null) return
         HOST_AVATAR_RETRIGGER_MILLIS.forEachIndexed { index, delay ->
             val last = index == HOST_AVATAR_RETRIGGER_MILLIS.lastIndex
@@ -3629,6 +3633,15 @@ internal class NotificationPanelHooks(
          * the stock icon sooner.
          */
         val HOST_AVATAR_RETRIGGER_MILLIS = longArrayOf(2_000L, 5_000L, 10_000L, 20_000L, 40_000L)
+
+        /**
+         * Rows that may hold a claim on [avatarRetriggers] at once.
+         *
+         * The claim is released by the last beat or by an answer, but a row detached mid-ladder
+         * never gets there. SystemUI lives for days, so the map needs a ceiling; a live claim that
+         * gets dropped with the rest only means one extra idempotent call into the host.
+         */
+        const val AVATAR_RETRIGGER_CAPACITY = 128
 
         /**
          * First beat of [HOST_AVATAR_RETRIGGER_MILLIS] that also composes the picture itself.

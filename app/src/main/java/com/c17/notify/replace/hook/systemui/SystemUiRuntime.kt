@@ -31,6 +31,9 @@ internal class SystemUiRuntime(
         }
         val iconConfiguration = OplusIconConfigurationReader(diagnostics)
         val themeIcons = ThemeIconProvider(diagnostics, iconConfiguration)
+        // Lives as long as the process: SystemUI shares this heap, and a host OOM takes the whole
+        // shade down with it (2026-11-10 16:10). See SystemUiHeapWatchdog for what it leaves behind.
+        SystemUiHeapWatchdog.start(diagnostics, themeIcons)
         val configuration = SystemUiConfiguration(
             openConfigPreferences = openConfigPreferences,
             sharedFiles = sharedFiles,
