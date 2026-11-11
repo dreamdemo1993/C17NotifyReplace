@@ -1840,6 +1840,19 @@ internal class NotificationPanelHooks(
                             avatarRetriggers.remove(key)
                             return@retrigger
                         }
+                        // The host's own composer refused, and the notification carries nothing to
+                        // compose from either. Per the row rules a message without a photo shows
+                        // the themed app icon, so from [HOST_AVATAR_FALLBACK_BEAT] on there is
+                        // nothing left to wait for: paint it and hand the slot back to the guard.
+                        // 2026-11-11 09:32 is exactly this row — `no-large-icon`, `provisional`,
+                        // beats answering `roundness=false`, and the stock green WeChat icon in
+                        // the screenshot half a minute later.
+                        if (index >= HOST_AVATAR_FALLBACK_BEAT &&
+                            !HostAvatarPresence.evaluate(icon.context, current).renderable &&
+                            paintThemedHeaderFallback(icon, rowView, current, snapshot, previous)
+                        ) {
+                            return@retrigger
+                        }
                     }
                     diagnostics.report(
                         level = DiagnosticLevel.Info,
@@ -1860,6 +1873,57 @@ internal class NotificationPanelHooks(
                 }
             }, delay)
         }
+    }
+
+    /**
+     * Paints the themed app icon into a header slot the host left on the bare glyph, and arms the
+     * guard that gives the slot back the moment the host composes a photo itself.
+     *
+     * Only for rows that carry no artwork of their own — those are the rows the rules send to the
+     * themed icon, and the host's refusal to compose is the confirmation that no photo is coming
+     * without a re-post. A miss (no themed icon resolvable, cold theme engine) writes nothing and
+     * leaves the ladder running.
+     */
+    private fun paintThemedHeaderFallback(
+        icon: ImageView,
+        rowView: View?,
+        sbn: StatusBarNotification,
+        snapshot: RuntimeSnapshot,
+        previous: Drawable?,
+    ): Boolean {
+        val plan = snapshot.resolver.resolvePanelIconPlan(
+            context = icon.context,
+            sbn = sbn,
+            originalSmallIcon = sbn.originalSmallIcon(diagnostics, snapshot.revision),
+            ignoreHostAvatar = true,
+        ) ?: return false
+        icon.applyRenderPlan(plan, PanelIconTarget.Header)
+        icon.drawable?.let { drawable -> headerIconClaims.claim(icon, sbn.key, drawable) }
+        headerPlaceholderGuards.put(
+            icon,
+            HeaderPlaceholderGuard(
+                icon = icon,
+                row = rowView,
+                sbn = sbn,
+                snapshot = snapshot,
+                plan = plan,
+                hostArtwork = previous,
+            ),
+        )?.stop()
+        headerPlaceholderGuards[icon]?.start()
+        avatarRetriggers.remove(sbn.key)
+        diagnostics.report(
+            level = DiagnosticLevel.Info,
+            event = DiagnosticEvent.HostAvatarReplace,
+            message = "角标诊断：${sbn.packageName} 通知里没有头像、宿主几拍也没合成，" +
+                "按规则铺主题图标，宿主画出头像再让路",
+            attributes = mapOf(
+                "package" to sbn.packageName,
+                "key" to sbn.key,
+            ),
+            occurrence = OccurrencePolicy.Once("panel:avatar_fallback_theme:${sbn.key}"),
+        )
+        return true
     }
 
     private fun applyPanelIcon(
@@ -3654,6 +3718,19 @@ internal class NotificationPanelHooks(
          * composer is used with the notification's photo and the themed app icon.
          */
         const val HOST_AVATAR_COMPOSE_BEAT = 1
+
+        /**
+         * Beat from which a row with no artwork of its own stops waiting and takes the themed icon.
+         *
+         * A yielded row had two ways out: the host paints a photo, or nothing does — and nothing
+         * was the case for [provisional] rows that never got one. Two beats in (10 s) the host has
+         * answered three times and the notification still carries no artwork, so the themed icon
+         * goes in and the guard takes over. Late enough that a host composing from its own contact
+         * store is never pre-empted, early enough to stay short of the 15 s "why is it still the
+         * raw icon" complaint (2026-11-11 09:32: the bare WeChat glyph was still on screen when the
+         * screenshot was taken, 5 s in, and never changed afterwards).
+         */
+        const val HOST_AVATAR_FALLBACK_BEAT = 2
 
         /**
          * Header icon box used when neither the host's own resolver nor the layout has an answer —
