@@ -7,6 +7,8 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffColorFilter
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.service.notification.StatusBarNotification
 import android.util.LruCache
@@ -69,6 +71,7 @@ internal class NotificationPanelHooks(
 
     /** Keys already covered by the retrigger ladder, so re-entrant binds do not stack new ones. */
     private val avatarRetriggers = ConcurrentHashMap<String, Long>()
+    private val detachHandler = Handler(Looper.getMainLooper())
 
     /** `OplusNotificationHeaderViewWrapperExImp.resolveHeaderIconContentSizePx()`, resolved once. */
     @Volatile
@@ -1706,6 +1709,20 @@ internal class NotificationPanelHooks(
         runCatching { members.notificationViewWrapperRow.get(wrapper) }.getOrNull()
             ?.let(::statusBarNotificationFromRow)
 
+    /**
+     * Bounds the guard maps' memory. Their values (the guards) hold the key (the row's ImageView)
+     * strongly, so a WeakHashMap never expunges those entries on its own; a view destroyed without
+     * a rebind would keep its guard — and the guard's notification and drawables — for the life of
+     * the process. Re-layouts re-attach within milliseconds, so a guard still detached a minute
+     * after detach belongs to a dead view. The next bind installs a fresh guard anyway.
+     */
+    private fun stopGuardIfStillDetached(icon: ImageView, stop: () -> Unit) {
+        detachHandler.postDelayed(
+            { if (!icon.isAttachedToWindow) stop() },
+            DETACHED_GUARD_STOP_MILLIS,
+        )
+    }
+
     /** True when the slot holds a picture the host composed, not the app's own icon. */
     private fun isHostComposedIcon(drawable: Drawable?): Boolean =
         drawable != null && drawable.javaClass.name.contains("DrawableWithBadge")
@@ -1758,11 +1775,23 @@ internal class NotificationPanelHooks(
             val last = index == HOST_AVATAR_RETRIGGER_MILLIS.lastIndex
             rowView.postDelayed(retrigger@{
                 try {
-                    if (!configuration.isCurrent(snapshot)) return@retrigger
-                    if (!icon.isAttachedToWindow) return@retrigger
+                    // Every early exit releases the claim: a beat that skips (shade closed, row
+                    // reused, config reload) must not block the next bind from arming a fresh
+                    // ladder — 2026-11-11 16:16 stayed on the raw icon because the skipped beats
+                    // kept the key claimed and the 16:17 rebind armed nothing.
+                    if (!configuration.isCurrent(snapshot)) {
+                        avatarRetriggers.remove(key)
+                        return@retrigger
+                    }
+                    if (!icon.isAttachedToWindow) {
+                        avatarRetriggers.remove(key)
+                        return@retrigger
+                    }
                     val current = runCatching { statusBarNotificationFromRow(rowView) }.getOrNull()
-                        ?: return@retrigger
-                    if (current.key != key) return@retrigger
+                    if (current == null || current.key != key) {
+                        avatarRetriggers.remove(key)
+                        return@retrigger
+                    }
                     // Only a slot that still shows the bare glyph is worth another host pass:
                     // re-running the method writes the raw icon first, so asking on a row that
                     // already has its picture would flash it away for a frame.
@@ -2023,18 +2052,18 @@ internal class NotificationPanelHooks(
                     // getPackageIconForNotification, so the native composition gets the themed
                     // corner badge without this class writing the ImageView at all.
                     //
-                    // "Personal message" is a row *type*, not a promise that a photo exists. Right
-                    // after a reboot WeChat posts the first message of the day from a cold process,
-                    // often with no `largeIcon` at all and no re-post for another ten seconds
-                    // (2026-11-10 16:11: the row answered `no-large-icon` and sat on the bare green
-                    // glyph until 16:11:34, when an update finally carried the photo). Handing
-                    // *that* row to the host buys nothing but the stock app icon — the one thing
-                    // this module exists to replace. So the yield only happens when the
-                    // notification actually carries artwork; without it the row falls through to
-                    // the ordinary branch below, which paints the themed icon at once and gives the
-                    // slot back to the host the moment it composes a photo.
+                    // "Personal message" is a row *type*, not a promise that a photo exists. A row
+                    // without artwork used to yield here on the *hope* that the host composes one
+                    // from its own contact store (`provisional`), and that hope cost the one picture
+                    // this module must never show: the bare app icon, for the whole 2-10 s ladder —
+                    // or forever when the shade closed before the ladder's later beats, which skip
+                    // detached rows (2026-11-11 09:32 and 16:16, both `no-large-icon`, both stock
+                    // green glyph in the screenshot). The host has never been observed composing
+                    // such a row. So only a notification that actually carries artwork yields;
+                    // everything else falls through to the ordinary branch below, which paints the
+                    // themed icon at once and gives the slot back the moment the host composes.
                     val hostAvatar = HostAvatarPresence.evaluate(icon.context, sbn)
-                    if (hostAvatar.renderable || hostAvatar.provisional) {
+                    if (hostAvatar.renderable) {
                         headerPlaceholderGuards.remove(icon)?.stop()
                         diagnostics.report(
                             level = DiagnosticLevel.Debug,
@@ -2113,6 +2142,13 @@ internal class NotificationPanelHooks(
                     // attach a photo. A photo that is already there keeps the old behaviour — see
                     // [guardHeaderIfHostSkipsAvatar] — because there the wait can still pay off.
                     if (!verdict.renderable) {
+                        // The host can compose between the post and this bind (its contact-store
+                        // pass is asynchronous). A composition already in the slot is the avatar
+                        // the user wants; painting over it would lose it until the next re-post.
+                        if (isHostComposedIcon(icon.drawable)) {
+                            headerPlaceholderGuards.remove(icon)?.stop()
+                            return
+                        }
                         val immediate = snapshot.resolver.resolvePanelIconPlan(
                             context = icon.context,
                             sbn = sbn,
@@ -2501,6 +2537,7 @@ internal class NotificationPanelHooks(
             // for the real exits (key swap, config swap, replacement by a newer guard).
             runCatching { observer?.takeIf { it.isAlive }?.removeOnPreDrawListener(this) }
             observer = null
+            stopGuardIfStillDetached(icon, ::stop)
         }
     }
 
@@ -3320,6 +3357,7 @@ internal class NotificationPanelHooks(
             // Same policy as IconTakeover: survive shade re-layouts, re-arm on the next attach.
             runCatching { observer?.takeIf { it.isAlive }?.removeOnPreDrawListener(this) }
             observer = null
+            stopGuardIfStillDetached(icon, ::stop)
         }
     }
 
@@ -3484,6 +3522,7 @@ internal class NotificationPanelHooks(
             // must survive them and re-arm on the next attach.
             runCatching { observer?.takeIf { it.isAlive }?.removeOnPreDrawListener(this) }
             observer = null
+            stopGuardIfStillDetached(icon, ::stop)
         }
     }
 
@@ -3706,6 +3745,15 @@ internal class NotificationPanelHooks(
          * gets dropped with the rest only means one extra idempotent call into the host.
          */
         const val AVATAR_RETRIGGER_CAPACITY = 128
+
+        /**
+         * How long a guard may stay installed on a detached view before it is stopped.
+         *
+         * Shade re-layouts re-attach rows within milliseconds; a view still detached after this
+         * window was destroyed without a rebind, and its guard would otherwise leak (the guard
+         * maps' values hold their keys strongly, so WeakHashMap cannot expunge them).
+         */
+        const val DETACHED_GUARD_STOP_MILLIS = 60_000L
 
         /**
          * First beat of [HOST_AVATAR_RETRIGGER_MILLIS] that also composes the picture itself.
