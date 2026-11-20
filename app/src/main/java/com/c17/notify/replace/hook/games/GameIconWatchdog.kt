@@ -140,16 +140,35 @@ internal object GameIconWatchdog {
      * artwork once the user stopped scrolling for a few seconds.
      */
     @Suppress("UNUSED_PARAMETER")
-    fun watch(icon: ImageView, drawable: Drawable, windowMillis: Long) {
+    fun watch(icon: ImageView, drawable: Drawable, windowMillis: Long, fitToSlot: Boolean = false) {
+        // The dock paints its own icons already sized to the icon slot (`override(w, w)`); themed
+        // artwork is not, so an unmeasured cell gets the artwork as-is and a measured one gets it
+        // redrawn at the slot's size. Nothing about the artwork's shape is touched.
+        val expected = if (fitToSlot) GameSlotIconFitter.fit(icon, drawable, diagnostics) else drawable
         // Register first: the write below goes through the interception hook itself, and the fresh
         // entry must already be in place or a rebinding cell would briefly swap back to the old
         // claim. Bumping the generation also cancels any pending background resolution of an
         // earlier bind of this recycled view.
-        synchronized(watched) {
-            generationOf(icon).incrementAndGet()
-            watched[icon] = Entry(drawable)
+        val generation = synchronized(watched) {
+            generationOf(icon).incrementAndGet().also { watched[icon] = Entry(expected) }
         }
-        icon.setImageDrawable(drawable)
+        icon.setImageDrawable(expected)
+        // A cell bound before its first layout has no width yet, so the fit above had nothing to
+        // measure against. One retry after layout is enough: by then the view reports the slot it
+        // was inflated to, and any later bind fits on the first attempt.
+        if (fitToSlot && icon.width <= 0) {
+            icon.post {
+                if (!isCurrent(icon, generation)) return@post
+                val claimed = synchronized(watched) { watched[icon] } ?: return@post
+                val fitted = GameSlotIconFitter.fit(icon, claimed.expected, diagnostics)
+                if (fitted === claimed.expected) return@post
+                synchronized(watched) {
+                    generationOf(icon).incrementAndGet()
+                    watched[icon] = Entry(fitted)
+                }
+                icon.setImageDrawable(fitted)
+            }
+        }
         diagnostics.report(
             level = DiagnosticLevel.Debug,
             event = DiagnosticEvent.GameAssistantWatchdog,
@@ -157,7 +176,8 @@ internal object GameIconWatchdog {
             attributes = mapOf(
                 "stage" to "watch",
                 "view" to icon.javaClass.name,
-                "drawable" to drawable.javaClass.name,
+                "drawable" to expected.javaClass.name,
+                "slot" to "${icon.width}x${icon.height}",
             ),
             occurrence = OccurrencePolicy.RateLimited("games:watchdog_watch", 2_000L),
         )

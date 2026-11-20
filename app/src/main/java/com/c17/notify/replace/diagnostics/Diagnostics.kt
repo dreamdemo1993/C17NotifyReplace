@@ -33,6 +33,7 @@ internal enum class DiagnosticEvent(val id: String) {
     GameAssistantHookResolved("games.hook_resolved"),
     GameAssistantCellBind("games.cell_bind"),
     GameAssistantWatchdog("games.watchdog"),
+    GameAssistantSlotFit("games.slot_fit"),
     ConfigLoaded("config.loaded"),
     ConfigLoadFailed("config.load_failed"),
     ConfigPublished("config.published"),
