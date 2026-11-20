@@ -137,11 +137,19 @@ internal class GameIconReplacer(
         canvas.clipPath(outline)
         val insetX = (width - width / zoom) / 2f
         val insetY = (height - height / zoom) / 2f
+        // `Canvas` only pairs an integer source rect with a float destination rect; the one-pixel
+        // truncation is invisible at icon scale and keeps the draw on a single API level.
+        val visible = Rect(
+            insetX.toInt(),
+            insetY.toInt(),
+            (width - insetX).toInt(),
+            (height - insetY).toInt(),
+        )
         canvas.drawBitmap(
             source,
-            RectF(insetX, insetY, width - insetX, height - insetY),
+            visible,
             RectF(0f, 0f, width.toFloat(), height.toFloat()),
-            FILL_PAINT,
+            Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true },
         )
         canvas.restore()
         return output
@@ -337,8 +345,5 @@ internal class GameIconReplacer(
          * 1.56 covers a corner radius up to about 40 % of the side, past anything a theme ships.
          */
         val ZOOM_STEPS = floatArrayOf(1.0f, 1.08f, 1.16f, 1.24f, 1.32f, 1.40f, 1.48f, 1.56f)
-
-        /** Smooth, filtered scaling: the dock icon is resampled on every fresh resolve. */
-        val FILL_PAINT = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true }
     }
 }
