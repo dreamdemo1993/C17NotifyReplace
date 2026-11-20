@@ -162,7 +162,7 @@ internal class GameAssistantRuntime(
         reportResolved(SITE_EDGE_PANEL, target.label)
         hooks.install(target.method, "games.edge_panel.app_icon") { chain ->
             val packageName = chain.args.getOrNull(0) as? String
-            replacer.drawableFor(SITE_EDGE_PANEL, packageName, fill = true) ?: chain.proceed()
+            replacer.drawableFor(SITE_EDGE_PANEL, packageName) ?: chain.proceed()
         }
     }
 
@@ -202,8 +202,8 @@ internal class GameAssistantRuntime(
                     // Fast path: the package's themed artwork is already in the process cache, so the
                     // view is claimed *before* the host bind runs and Glide's cached original never
                     // lands at all — no flash, no measurable cost.
-                    val fastPkg = candidates.firstOrNull { replacer.cachedDrawableFor(it, fill = true) != null }
-                    val fastThemed = fastPkg?.let { replacer.cachedDrawableFor(it, fill = true) }
+                    val fastPkg = candidates.firstOrNull { replacer.cachedDrawableFor(it) != null }
+                    val fastThemed = fastPkg?.let { replacer.cachedDrawableFor(it) }
                     var mode = "pending"
                     if (fastThemed != null) {
                         mode = "fast"
@@ -218,9 +218,7 @@ internal class GameAssistantRuntime(
                         val generation = GameIconWatchdog.reserve(icon)
                         resolverExecutor.execute {
                             val packageName = pickPackage(candidates, replacer)
-                            val themed = packageName?.let {
-                                replacer.drawableFor(SITE_EDGE_PANEL, it, fill = true)
-                            }
+                            val themed = packageName?.let { replacer.drawableFor(SITE_EDGE_PANEL, it) }
                             mainHandler.post {
                                 if (GameIconWatchdog.isCurrent(icon, generation)) {
                                     themed?.let { GameIconWatchdog.watch(icon, it, EDGE_CELL_WINDOW_MILLIS) }

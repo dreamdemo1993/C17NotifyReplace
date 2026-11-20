@@ -4,10 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.SystemClock
@@ -35,31 +32,15 @@ internal class GameIconReplacer(
     /** Packages the theme engine had no artwork for, with the time the answer may be re-asked. */
     private val missUntil = android.util.LruCache<String, Long>(MAX_CACHED_MISSES)
 
-    /**
-     * Dock variants of themed artwork, keyed by the exact bitmap the theme cache handed out.
-     *
-     * Keying on the instance instead of the package name is what keeps this from going stale: a
-     * theme switch drops the provider's cache, a fresh bitmap is resolved, and the old entry simply
-     * has no key left to match. A package-name key would keep painting the previous theme's icon
-     * until the process happened to restart.
-     */
-    private val dockVariants = java.util.WeakHashMap<Bitmap, Bitmap>()
-
-    /**
-     * @param fill re-masks the artwork to fill the game assistant's rounded-square dock cell, see
-     *   [fillRoundedSquare]. Only the app strip asks for it; desktop, barrage and message-box
-     *   artwork must stay exactly as the theme engine drew it.
-     */
-    fun drawableFor(site: String, packageName: String?, fill: Boolean = false): Drawable? {
+    fun drawableFor(site: String, packageName: String?): Drawable? {
         val pkg = packageName?.trim().orEmpty()
         if (pkg.isEmpty() || pkg == SELF_PACKAGE) return null
         val context = application() ?: return null
-        val resolved = bitmapFor(context, pkg) ?: run {
+        val bitmap = bitmapFor(context, pkg) ?: run {
             traceMiss(site, pkg)
             return null
         }
-        val bitmap = if (fill) filledBitmap(resolved) else resolved
-        traceReplace(site, pkg, fill)
+        traceReplace(site, pkg)
         return BitmapDrawable(context.resources, bitmap).mutate()
     }
 
@@ -79,116 +60,15 @@ internal class GameIconReplacer(
      * resolves stored and is guaranteed to never issue a cross-process call. A null means "resolve
      * it properly, off the UI thread" — nothing more.
      */
-    fun cachedDrawableFor(packageName: String?, fill: Boolean = false): Drawable? {
+    fun cachedDrawableFor(packageName: String?): Drawable? {
         val pkg = packageName?.trim().orEmpty()
         if (pkg.isEmpty() || pkg == SELF_PACKAGE) return null
         val context = application() ?: return null
         val now = SystemClock.elapsedRealtime()
         if (missUntil.get(pkg)?.let { it > now } == true) return null
-        val cached = themeIcons.peekCached(context, pkg) ?: return null
-        val bitmap = if (fill) filledBitmap(cached) else cached
+        val bitmap = themeIcons.peekCached(context, pkg) ?: return null
         return BitmapDrawable(context.resources, bitmap).mutate()
     }
-
-    /**
-     * The dock-shaped variant of [source], computed once per resolved bitmap.
-     *
-     * Re-masking costs a bitmap allocation and a draw; a flung app strip binds the same cells over
-     * and over, so the answer is memoised. Bitmaps that cannot be re-drawn are memoised only when a
-     * distinct copy was produced — caching an identity mapping would make the value keep its own
-     * key alive inside the `WeakHashMap` and leak one bitmap per package.
-     */
-    private fun filledBitmap(source: Bitmap): Bitmap {
-        synchronized(dockVariants) { dockVariants[source] }?.let { return it }
-        val filled = runCatching { fillRoundedSquare(source) }.getOrDefault(source)
-        if (filled !== source) {
-            synchronized(dockVariants) { dockVariants[source] = filled }
-        }
-        return filled
-    }
-
-    /**
-     * Re-masks themed artwork so it fills the dock cell edge to edge.
-     *
-     * 11.0.3 repainted the app strip as rounded-square cells and dropped the shape transform the old
-     * cell used to apply, so the theme bitmap now reaches the screen exactly as the theme engine
-     * drew it: a squircle whose four corners are transparent. Measured on a 1920 px screenshot the
-     * cell is 77 px with a corner radius of roughly 33 % — a third of every side is empty, the
-     * cell's own backing shows through and the icon reads as "smaller than its slot" (report
-     * 2026-11-20 "主题图标覆盖不完全").
-     *
-     * The artwork is zoomed just far enough that the cell's four corners land on opaque pixels, then
-     * clipped to a rounded square with [CORNER_RATIO] corners: the cell is fully covered while the
-     * silhouette stays soft instead of turning into a hard square. Artwork that already reaches its
-     * own edges is left unzoomed, so a theme shipping square icons is not cropped.
-     */
-    private fun fillRoundedSquare(source: Bitmap): Bitmap {
-        val width = source.width
-        val height = source.height
-        if (width < 2 || height < 2) return source
-        val zoom = cornerZoom(source)
-        val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(output)
-        val radius = minOf(width, height) * CORNER_RATIO
-        val outline = Path().apply {
-            addRoundRect(0f, 0f, width.toFloat(), height.toFloat(), radius, radius, Path.Direction.CCW)
-        }
-        canvas.save()
-        canvas.clipPath(outline)
-        val insetX = (width - width / zoom) / 2f
-        val insetY = (height - height / zoom) / 2f
-        // `Canvas` only pairs an integer source rect with a float destination rect; the one-pixel
-        // truncation is invisible at icon scale and keeps the draw on a single API level.
-        val visible = Rect(
-            insetX.toInt(),
-            insetY.toInt(),
-            (width - insetX).toInt(),
-            (height - insetY).toInt(),
-        )
-        canvas.drawBitmap(
-            source,
-            visible,
-            RectF(0f, 0f, width.toFloat(), height.toFloat()),
-            Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true },
-        )
-        canvas.restore()
-        return output
-    }
-
-    /**
-     * Smallest zoom at which the output's four corners sit on opaque artwork.
-     *
-     * Walked in [ZOOM_STEPS] rather than solved, because the exact corner shape is the theme
-     * engine's business (squircle, rounded square, nothing at all). Sampling four pixels per step
-     * keeps this far below the cost of the cross-process resolve that produced the bitmap.
-     */
-    private fun cornerZoom(source: Bitmap): Float {
-        val width = source.width
-        val height = source.height
-        val probeX = (width * CORNER_PROBE_RATIO).toInt().coerceAtLeast(1)
-        val probeY = (height * CORNER_PROBE_RATIO).toInt().coerceAtLeast(1)
-        for (zoom in ZOOM_STEPS) {
-            val left = sourceIndex(probeX, width, zoom)
-            val right = sourceIndex(width - 1 - probeX, width, zoom)
-            val top = sourceIndex(probeY, height, zoom)
-            val bottom = sourceIndex(height - 1 - probeY, height, zoom)
-            // A bitmap that cannot be sampled (hardware or already recycled) must not be cropped on
-            // a guess: treat it as covered and leave the artwork at its own size.
-            val covered = runCatching {
-                opaqueAt(source, left, top) && opaqueAt(source, right, top) &&
-                    opaqueAt(source, left, bottom) && opaqueAt(source, right, bottom)
-            }.getOrDefault(true)
-            if (covered) return zoom
-        }
-        return ZOOM_STEPS.last()
-    }
-
-    /** Where [point] of the output lands in the source once it is scaled by [zoom] and centred. */
-    private fun sourceIndex(point: Int, size: Int, zoom: Float): Int =
-        ((point - size / 2f) / zoom + size / 2f).toInt().coerceIn(0, size - 1)
-
-    private fun opaqueAt(source: Bitmap, x: Int, y: Int): Boolean =
-        Color.alpha(source.getPixel(x, y)) >= OPAQUE_ALPHA
 
     /**
      * [ThemeIconProvider] caches hits for a long time but misses for exactly one second — the shade
@@ -289,16 +169,12 @@ internal class GameIconReplacer(
         null
     }
 
-    private fun traceReplace(site: String, pkg: String, fill: Boolean) {
+    private fun traceReplace(site: String, pkg: String) {
         diagnostics.report(
             level = DiagnosticLevel.Info,
             event = DiagnosticEvent.GameAssistantIconReplaced,
             message = "游戏助手图标已替换为主题图标",
-            attributes = mapOf(
-                "site" to site,
-                "pkg" to pkg,
-                "fill" to if (fill) "dock" else "artwork",
-            ),
+            attributes = mapOf("site" to site, "pkg" to pkg),
             occurrence = OccurrencePolicy.RateLimited("games:replace:$site", TRACE_INTERVAL_MILLIS),
         )
     }
@@ -330,20 +206,5 @@ internal class GameIconReplacer(
 
         /** Below this the resolved bitmap *is* the launcher icon, i.e. nothing was themed. */
         const val PLAIN_ARTWORK_TOLERANCE = 8.0
-
-        /** Corner radius of a dock icon, as a fraction of its side. Kept soft, not a hard square. */
-        const val CORNER_RATIO = 0.20f
-
-        /** How far inside the output corner a pixel still counts as "the corner itself". */
-        const val CORNER_PROBE_RATIO = 0.03f
-
-        /** Alpha from which a pixel counts as painted artwork rather than a transparent corner. */
-        const val OPAQUE_ALPHA = 200
-
-        /**
-         * Zoom candidates, smallest first. 1.0 already covers artwork that reaches its own edges;
-         * 1.56 covers a corner radius up to about 40 % of the side, past anything a theme ships.
-         */
-        val ZOOM_STEPS = floatArrayOf(1.0f, 1.08f, 1.16f, 1.24f, 1.32f, 1.40f, 1.48f, 1.56f)
     }
 }
