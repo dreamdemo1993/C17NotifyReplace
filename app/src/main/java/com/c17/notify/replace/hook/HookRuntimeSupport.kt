@@ -151,8 +151,5 @@ private val TRACED_EVENTS = setOf(
     DiagnosticEvent.GameAssistantHookResolved,
     DiagnosticEvent.GameAssistantCellBind,
     DiagnosticEvent.GameAssistantWatchdog,
-    // One line per burst: whether the themed artwork was drawn at the icon slot's size, and by how
-    // much it had to be resized. Answers "why is this icon still smaller than its cell".
-    DiagnosticEvent.GameAssistantSlotFit,
     DiagnosticEvent.ThemeIconBlank,
 )

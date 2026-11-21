@@ -207,7 +207,7 @@ internal class GameAssistantRuntime(
                     var mode = "pending"
                     if (fastThemed != null) {
                         mode = "fast"
-                        GameIconWatchdog.watch(icon, fastThemed, EDGE_CELL_WINDOW_MILLIS, fitToSlot = true)
+                        GameIconWatchdog.watch(icon, fastThemed, EDGE_CELL_WINDOW_MILLIS, clearPlate = true)
                     } else {
                         // Uncached: a real resolve costs a cross-process call (22-60 ms measured),
                         // which on the UI thread is exactly the scroll stutter. It moves to a
@@ -221,14 +221,7 @@ internal class GameAssistantRuntime(
                             val themed = packageName?.let { replacer.drawableFor(SITE_EDGE_PANEL, it) }
                             mainHandler.post {
                                 if (GameIconWatchdog.isCurrent(icon, generation)) {
-                                    themed?.let {
-                                        GameIconWatchdog.watch(
-                                            icon,
-                                            it,
-                                            EDGE_CELL_WINDOW_MILLIS,
-                                            fitToSlot = true,
-                                        )
-                                    }
+                                    themed?.let { GameIconWatchdog.watch(icon, it, EDGE_CELL_WINDOW_MILLIS, clearPlate = true) }
                                 }
                             }
                         }

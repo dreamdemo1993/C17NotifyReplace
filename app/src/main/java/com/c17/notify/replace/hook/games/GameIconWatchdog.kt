@@ -31,7 +31,11 @@ import java.util.WeakHashMap
  */
 internal object GameIconWatchdog {
 
-    private class Entry(val expected: Drawable)
+    /**
+     * [plate] is the backing the claim removed from the view, if it removed one — see [watch].
+     * Kept so [release] can hand the cell back exactly as the host left it.
+     */
+    private class Entry(val expected: Drawable, val plate: Drawable? = null)
 
     private val watched = WeakHashMap<ImageView, Entry>()
 
@@ -140,35 +144,30 @@ internal object GameIconWatchdog {
      * artwork once the user stopped scrolling for a few seconds.
      */
     @Suppress("UNUSED_PARAMETER")
-    fun watch(icon: ImageView, drawable: Drawable, windowMillis: Long, fitToSlot: Boolean = false) {
-        // The dock paints its own icons already sized to the icon slot (`override(w, w)`); themed
-        // artwork is not, so an unmeasured cell gets the artwork as-is and a measured one gets it
-        // redrawn at the slot's size. Nothing about the artwork's shape is touched.
-        val expected = if (fitToSlot) GameSlotIconFitter.fit(icon, drawable, diagnostics) else drawable
+    fun watch(icon: ImageView, drawable: Drawable, windowMillis: Long, clearPlate: Boolean = false) {
         // Register first: the write below goes through the interception hook itself, and the fresh
         // entry must already be in place or a rebinding cell would briefly swap back to the old
         // claim. Bumping the generation also cancels any pending background resolution of an
         // earlier bind of this recycled view.
-        val generation = synchronized(watched) {
-            generationOf(icon).incrementAndGet().also { watched[icon] = Entry(expected) }
-        }
-        icon.setImageDrawable(expected)
-        // A cell bound before its first layout has no width yet, so the fit above had nothing to
-        // measure against. One retry after layout is enough: by then the view reports the slot it
-        // was inflated to, and any later bind fits on the first attempt.
-        if (fitToSlot && icon.width <= 0) {
-            icon.post {
-                if (!isCurrent(icon, generation)) return@post
-                val claimed = synchronized(watched) { watched[icon] } ?: return@post
-                val fitted = GameSlotIconFitter.fit(icon, claimed.expected, diagnostics)
-                if (fitted === claimed.expected) return@post
-                synchronized(watched) {
-                    generationOf(icon).incrementAndGet()
-                    watched[icon] = Entry(fitted)
-                }
-                icon.setImageDrawable(fitted)
+        //
+        // Dock cells also lose their backing plate here. The host lays a pale rounded square under
+        // every app icon; a themed icon is drawn on top of that plate rather than replacing it, so
+        // the plate showed through the artwork's transparent corners as a lighter rim
+        // (reported 2026-11-21: "没有完全覆盖，旁边还是有阴影"、"四个角的颜色和别处不一样").
+        // Dropping the plate lets the panel itself show at the corners, which is how re.14 looked.
+        // The message-box badge passes clearPlate = false: its backing is an app-icon frame, not a
+        // cell plate.
+        synchronized(watched) {
+            generationOf(icon).incrementAndGet()
+            val previous = watched[icon]
+            val plate = previous?.plate ?: if (clearPlate) {
+                icon.background?.also { icon.background = null }
+            } else {
+                null
             }
+            watched[icon] = Entry(drawable, plate)
         }
+        icon.setImageDrawable(drawable)
         diagnostics.report(
             level = DiagnosticLevel.Debug,
             event = DiagnosticEvent.GameAssistantWatchdog,
@@ -176,8 +175,8 @@ internal object GameIconWatchdog {
             attributes = mapOf(
                 "stage" to "watch",
                 "view" to icon.javaClass.name,
-                "drawable" to expected.javaClass.name,
-                "slot" to "${icon.width}x${icon.height}",
+                "drawable" to drawable.javaClass.name,
+                "plate" to (synchronized(watched) { watched[icon]?.plate }?.javaClass?.name ?: "none"),
             ),
             occurrence = OccurrencePolicy.RateLimited("games:watchdog_watch", 2_000L),
         )
@@ -189,10 +188,13 @@ internal object GameIconWatchdog {
      * a recycled cell binds to a package whose themed artwork is not cached yet.
      */
     fun release(icon: ImageView) {
-        synchronized(watched) {
+        val plate = synchronized(watched) {
             generationOf(icon).incrementAndGet()
-            watched.remove(icon)
+            watched.remove(icon)?.plate
         }
+        // A recycled view that binds to a package without themed artwork must look like an
+        // untouched dock cell, so the plate goes back with the claim.
+        if (plate != null) runCatching { icon.background = plate }
     }
 
     /** Marks the start of a background resolution; returns the generation token to fulfill with. */
