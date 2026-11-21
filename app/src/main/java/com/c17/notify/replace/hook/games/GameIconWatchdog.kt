@@ -32,10 +32,17 @@ import java.util.WeakHashMap
 internal object GameIconWatchdog {
 
     /**
-     * [plate] is the backing the claim removed from the view, if it removed one — see [watch].
-     * Kept so [release] can hand the cell back exactly as the host left it.
+     * A backing this claim took off a view, kept so [release] can put it back.
+     *
+     * The dock lays a pale rounded square behind each app icon. Themed artwork is drawn *over* that
+     * plate rather than replacing it, so the plate shows through the artwork's transparent corners
+     * as a lighter rim (reported 2026-11-21: "没有完全覆盖，旁边还是有阴影"、"四个角的颜色和别处
+     * 不一样"). Where the plate lives is not fixed: the icon view itself on some builds, an
+     * icon-sized wrapper on others — hence a list of (view, drawable).
      */
-    private class Entry(val expected: Drawable, val plate: Drawable? = null)
+    private class Plate(val view: android.view.View, val background: Drawable)
+
+    private class Entry(val expected: Drawable, val plates: List<Plate> = emptyList())
 
     private val watched = WeakHashMap<ImageView, Entry>()
 
@@ -47,6 +54,15 @@ internal object GameIconWatchdog {
     private val generations = WeakHashMap<ImageView, java.util.concurrent.atomic.AtomicInteger>()
 
     private var installed = false
+
+    /** How many ancestors above the icon view are examined for an icon-sized plate. */
+    private const val PLATE_ANCESTOR_DEPTH = 3
+
+    /**
+     * An ancestor counts as "the cell" only while it is no bigger than this multiple of the icon —
+     * a row or the panel is far larger, and stripping its background would change the app.
+     */
+    private const val PLATE_MAX_RATIO = 1.35f
 
     private lateinit var diagnostics: Diagnostics
 
@@ -86,6 +102,10 @@ internal object GameIconWatchdog {
             val incoming = chain.args.getOrNull(0) as? Drawable
             val expected = if (view != null) replacementFor(view, incoming) else null
             if (view != null && expected != null && incoming != null) {
+                // The host usually re-applies a cell's background right before writing its icon, so
+                // a plate dropped at claim time can come back. Dropping it again here — on the write
+                // that would put the original artwork on screen — covers that ordering.
+                ensurePlatesCleared(view)
                 traceIntercept(view, incoming)
                 val newArgs = chain.args.toTypedArray().also { it[0] = expected }
                 chain.proceed(newArgs)
@@ -111,6 +131,7 @@ internal object GameIconWatchdog {
                 val entry = synchronized(watched) { watched[view] }
                 val claimedBitmap = (entry?.expected as? android.graphics.drawable.BitmapDrawable)?.bitmap
                 if (claimedBitmap != null && claimedBitmap !== incoming) {
+                    ensurePlatesCleared(view)
                     traceIntercept(view, null)
                     val newArgs = chain.args.toTypedArray().also { it[0] = claimedBitmap }
                     chain.proceed(newArgs)
@@ -150,22 +171,18 @@ internal object GameIconWatchdog {
         // claim. Bumping the generation also cancels any pending background resolution of an
         // earlier bind of this recycled view.
         //
-        // Dock cells also lose their backing plate here. The host lays a pale rounded square under
-        // every app icon; a themed icon is drawn on top of that plate rather than replacing it, so
-        // the plate showed through the artwork's transparent corners as a lighter rim
-        // (reported 2026-11-21: "没有完全覆盖，旁边还是有阴影"、"四个角的颜色和别处不一样").
-        // Dropping the plate lets the panel itself show at the corners, which is how re.14 looked.
-        // The message-box badge passes clearPlate = false: its backing is an app-icon frame, not a
-        // cell plate.
+        // Dock cells also lose their backing plates here — the icon's own and, when this build's
+        // skin layer paints it on a wrapper, an icon-sized ancestor's. Themed artwork is drawn on
+        // top of that plate rather than replacing it, so the plate shows through the artwork's
+        // transparent corners as a lighter rim (reported 2026-11-21: "没有完全覆盖，旁边还是有阴影"、
+        // "四个角的颜色和别处不一样"). Dropping it lets the panel itself show at the corners, which is
+        // how re.14 looked. The message-box badge passes clearPlate = false: its backing is an
+        // app-icon frame, not a cell plate.
         synchronized(watched) {
             generationOf(icon).incrementAndGet()
             val previous = watched[icon]
-            val plate = previous?.plate ?: if (clearPlate) {
-                icon.background?.also { icon.background = null }
-            } else {
-                null
-            }
-            watched[icon] = Entry(drawable, plate)
+            val plates = previous?.plates ?: if (clearPlate) takePlates(icon) else emptyList()
+            watched[icon] = Entry(drawable, plates)
         }
         icon.setImageDrawable(drawable)
         diagnostics.report(
@@ -176,10 +193,75 @@ internal object GameIconWatchdog {
                 "stage" to "watch",
                 "view" to icon.javaClass.name,
                 "drawable" to drawable.javaClass.name,
-                "plate" to (synchronized(watched) { watched[icon]?.plate }?.javaClass?.name ?: "none"),
+                "plates" to (synchronized(watched) { watched[icon]?.plates }
+                    ?.joinToString(">") { it.background.javaClass.simpleName }
+                    ?.ifEmpty { "none" } ?: "none"),
+                // Only worth logging when nothing was found: it tells the next report whether the
+                // pale corners come from an ancestor this module never touched.
+                "chain" to (if (synchronized(watched) { watched[icon]?.plates }?.isEmpty() != false) {
+                    describeChain(icon)
+                } else {
+                    "-"
+                }),
             ),
             occurrence = OccurrencePolicy.RateLimited("games:watchdog_watch", 2_000L),
         )
+    }
+
+    /**
+     * Takes the cell's backing off [icon] and off any icon-sized ancestor, returning what it took.
+     *
+     * The icon view is the first candidate. When the skin layer in this build paints the plate on a
+     * wrapper instead, the wrapper is still exactly icon-sized — a row or the panel is not — so the
+     * size comparison is what keeps this from stripping a whole row's background.
+     */
+    private fun takePlates(icon: ImageView): List<Plate> {
+        val taken = ArrayList<Plate>(2)
+        icon.background?.let {
+            taken += Plate(icon, it)
+            icon.background = null
+        }
+        if (icon.width <= 0 || icon.height <= 0) return taken
+        var parent = icon.parent
+        var depth = 0
+        while (parent is android.view.View && depth < PLATE_ANCESTOR_DEPTH) {
+            val wrapper: android.view.View = parent
+            val sized = wrapper.width in 1..(icon.width * PLATE_MAX_RATIO).toInt() &&
+                wrapper.height in 1..(icon.height * PLATE_MAX_RATIO).toInt()
+            if (sized) {
+                wrapper.background?.let {
+                    taken += Plate(wrapper, it)
+                    wrapper.background = null
+                }
+            }
+            parent = wrapper.parent
+            depth++
+        }
+        return taken
+    }
+
+    /** Puts back every plate the claim took, if the host re-applied one in the meantime. */
+    private fun ensurePlatesCleared(icon: ImageView) {
+        val plates = synchronized(watched) { watched[icon]?.plates } ?: return
+        for (plate in plates) {
+            if (plate.view.background != null) runCatching { plate.view.background = null }
+        }
+    }
+
+    /** `Class#bg@64x64<Class#none@64x64` for the claim's view and its ancestors. */
+    private fun describeChain(icon: ImageView): String {
+        val parts = ArrayList<String>(PLATE_ANCESTOR_DEPTH + 1)
+        var next: android.view.View? = icon
+        var depth = 0
+        while (depth <= PLATE_ANCESTOR_DEPTH) {
+            val current: android.view.View = next ?: break
+            val bg = current.background
+            parts += "${current.javaClass.simpleName}#${bg?.javaClass?.simpleName ?: "none"}" +
+                "@${current.width}x${current.height}"
+            next = current.parent as? android.view.View
+            depth++
+        }
+        return parts.joinToString("<")
     }
 
     /**
@@ -188,13 +270,13 @@ internal object GameIconWatchdog {
      * a recycled cell binds to a package whose themed artwork is not cached yet.
      */
     fun release(icon: ImageView) {
-        val plate = synchronized(watched) {
+        val plates = synchronized(watched) {
             generationOf(icon).incrementAndGet()
-            watched.remove(icon)?.plate
+            watched.remove(icon)?.plates
         }
         // A recycled view that binds to a package without themed artwork must look like an
-        // untouched dock cell, so the plate goes back with the claim.
-        if (plate != null) runCatching { icon.background = plate }
+        // untouched dock cell, so the plates go back with the claim.
+        plates?.forEach { plate -> runCatching { plate.view.background = plate.background } }
     }
 
     /** Marks the start of a background resolution; returns the generation token to fulfill with. */
