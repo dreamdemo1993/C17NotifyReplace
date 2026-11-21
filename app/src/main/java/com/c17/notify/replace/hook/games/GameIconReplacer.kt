@@ -6,7 +6,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.SystemClock
@@ -34,10 +33,17 @@ internal class GameIconReplacer(
     /** Packages the theme engine had no artwork for, with the time the answer may be re-asked. */
     private val missUntil = android.util.LruCache<String, Long>(MAX_CACHED_MISSES)
 
-    /** Fitted copies, keyed by the provider's cached bitmap — a theme switch yields new bitmaps. */
-    private val fitted = object : android.util.LruCache<Bitmap, Bitmap>(MAX_CACHED_FITS) {}
+    /** Circular copies, keyed by the provider's cached bitmap — a theme switch yields new bitmaps. */
+    private val circular = object : android.util.LruCache<Bitmap, Bitmap>(MAX_CACHED_MASKS) {}
 
-    fun drawableFor(site: String, packageName: String?): Drawable? {
+    /**
+     * @param circle crop the artwork to the [ApkIconShape.CIRCLE] the dock asks the host for. The
+     *   dock's own icons are masked inside Glide (`oke.I` → `fj2`, which draws a filled circle);
+     *   this module writes the drawable straight through `setImageDrawable` and therefore bypasses
+     *   that pipeline, so the mask has to be reproduced here or the icon shows its unmasked
+     *   rounded-square artwork with the theme's soft outer glow around it.
+     */
+    fun drawableFor(site: String, packageName: String?, circle: Boolean = false): Drawable? {
         val pkg = packageName?.trim().orEmpty()
         if (pkg.isEmpty() || pkg == SELF_PACKAGE) return null
         val context = application() ?: return null
@@ -46,7 +52,8 @@ internal class GameIconReplacer(
             return null
         }
         traceReplace(site, pkg)
-        return BitmapDrawable(context.resources, fittedArtwork(bitmap)).mutate()
+        val artwork = if (circle) circularArtwork(bitmap) else bitmap
+        return BitmapDrawable(context.resources, artwork).mutate()
     }
 
     /**
@@ -65,73 +72,53 @@ internal class GameIconReplacer(
      * resolves stored and is guaranteed to never issue a cross-process call. A null means "resolve
      * it properly, off the UI thread" — nothing more.
      */
-    fun cachedDrawableFor(packageName: String?): Drawable? {
+    fun cachedDrawableFor(packageName: String?, circle: Boolean = false): Drawable? {
         val pkg = packageName?.trim().orEmpty()
         if (pkg.isEmpty() || pkg == SELF_PACKAGE) return null
         val context = application() ?: return null
         val now = SystemClock.elapsedRealtime()
         if (missUntil.get(pkg)?.let { it > now } == true) return null
         val bitmap = themeIcons.peekCached(context, pkg) ?: return null
-        return BitmapDrawable(context.resources, fittedArtwork(bitmap)).mutate()
+        val artwork = if (circle) circularArtwork(bitmap) else bitmap
+        return BitmapDrawable(context.resources, artwork).mutate()
     }
 
     /**
-     * Fits the artwork's opaque core to its frame, dropping a translucent outer glow.
+     * Center-crops the artwork and fills an inscribed circle, i.e. the mask the dock's own Glide
+     * pipeline applies for [ApkIconShape.CIRCLE].
      *
-     * The theme engine wraps most themed icons in a soft glow. [ThemeIconProvider] counts any pixel
-     * above alpha 8 as content, so that glow becomes the outermost ring of the rendered square: the
-     * opaque artwork ends up inset by the glow's width, and the glow itself is stretched into a
-     * translucent rim. On the dock's dark rail a translucent rim reads as a paler outline around
-     * every icon, which is what "图标还是没有完全覆盖，旁边还是有阴影" and "四个角的颜色和别处
-     * 不一样" describe — and why the corner samples differ from the rest of the icon.
-     *
-     * Scaling the opaque box up to the full frame removes the rim and leaves the artwork flush with
-     * its cell, without adding a fill colour or changing the shape (re.14.1 was rejected for doing
-     * both). The cap keeps a genuinely inset design — a small glyph on a plate — from being blown up.
+     * The dock asks the host for circle-shaped app icons (`oke.E` / `oke.F` are called with
+     * `ApkIconShape.CIRCLE`), and the theme artwork is a rounded square wrapped in a translucent
+     * glow. Writing it unmasked — which is what a `setImageDrawable` hook does — puts that glow on
+     * screen as a paler rim around a square. Masking to a circle reproduces what the panel looked
+     * like before the dock moved the mask into Glide, and the glow falls outside the mask entirely.
      */
-    private fun fittedArtwork(source: Bitmap): Bitmap {
-        fitted.get(source)?.let { return it }
-        val width = source.width
-        val height = source.height
-        if (width <= 0 || height <= 0) return source
-        var left = width
-        var top = height
-        var right = -1
-        var bottom = -1
-        val pixels = IntArray(width * height)
-        runCatching { source.getPixels(pixels, 0, width, 0, 0, width, height) }.getOrNull()
-            ?: return source
-        for (y in 0 until height) {
-            val row = y * width
-            for (x in 0 until width) {
-                if ((pixels[row + x] ushr 24) < CORE_ALPHA) continue
-                if (x < left) left = x
-                if (x > right) right = x
-                if (y < top) top = y
-                if (y > bottom) bottom = y
-            }
-        }
-        if (right < left || bottom < top) return source
-        val coreWidth = right - left + 1
-        val coreHeight = bottom - top + 1
-        if (coreWidth >= width && coreHeight >= height) return source
-        val scale = maxOf(width.toFloat() / coreWidth, height.toFloat() / coreHeight)
-        if (scale - 1f > MAX_FIT_SCALE) return source
+    private fun circularArtwork(source: Bitmap): Bitmap {
+        circular.get(source)?.let { return it }
+        val size = minOf(source.width, source.height)
+        if (size <= 0) return source
         val result = runCatching {
-            val scaledWidth = coreWidth * scale
-            val scaledHeight = coreHeight * scale
-            val offsetX = (width - scaledWidth) / 2f
-            val offsetY = (height - scaledHeight) / 2f
-            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { target ->
-                Canvas(target).drawBitmap(
-                    source,
-                    Rect(left, top, right + 1, bottom + 1),
-                    RectF(offsetX, offsetY, offsetX + scaledWidth, offsetY + scaledHeight),
-                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG),
-                )
+            val shader = android.graphics.BitmapShader(
+                source,
+                android.graphics.Shader.TileMode.CLAMP,
+                android.graphics.Shader.TileMode.CLAMP,
+            )
+            val matrix = android.graphics.Matrix()
+            // 1:1, centred: the output square is the source's smaller side, so this is the "center
+            // crop" half of the mask and the circle fills the frame edge to edge.
+            matrix.postTranslate(
+                (size - source.width) / 2f,
+                (size - source.height) / 2f,
+            )
+            shader.setLocalMatrix(matrix)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            paint.shader = shader
+            Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also { target ->
+                val radius = size / 2f
+                Canvas(target).drawCircle(radius, radius, radius, paint)
             }
         }.getOrNull() ?: return source
-        fitted.put(source, result)
+        circular.put(source, result)
         return result
     }
 
@@ -272,12 +259,6 @@ internal class GameIconReplacer(
         /** Below this the resolved bitmap *is* the launcher icon, i.e. nothing was themed. */
         const val PLAIN_ARTWORK_TOLERANCE = 8.0
 
-        /** Alpha that counts as artwork rather than as the theme's outer glow. */
-        const val CORE_ALPHA = 128
-
-        /** Largest upscale [fittedArtwork] will apply before deciding this is not a glow at all. */
-        const val MAX_FIT_SCALE = 0.2f
-
-        const val MAX_CACHED_FITS = 64
+        const val MAX_CACHED_MASKS = 64
     }
 }
