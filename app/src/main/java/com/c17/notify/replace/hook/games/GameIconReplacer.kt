@@ -4,7 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.SystemClock
@@ -32,6 +34,9 @@ internal class GameIconReplacer(
     /** Packages the theme engine had no artwork for, with the time the answer may be re-asked. */
     private val missUntil = android.util.LruCache<String, Long>(MAX_CACHED_MISSES)
 
+    /** Fitted copies, keyed by the provider's cached bitmap — a theme switch yields new bitmaps. */
+    private val fitted = object : android.util.LruCache<Bitmap, Bitmap>(MAX_CACHED_FITS) {}
+
     fun drawableFor(site: String, packageName: String?): Drawable? {
         val pkg = packageName?.trim().orEmpty()
         if (pkg.isEmpty() || pkg == SELF_PACKAGE) return null
@@ -41,7 +46,7 @@ internal class GameIconReplacer(
             return null
         }
         traceReplace(site, pkg)
-        return BitmapDrawable(context.resources, bitmap).mutate()
+        return BitmapDrawable(context.resources, fittedArtwork(bitmap)).mutate()
     }
 
     /**
@@ -67,7 +72,67 @@ internal class GameIconReplacer(
         val now = SystemClock.elapsedRealtime()
         if (missUntil.get(pkg)?.let { it > now } == true) return null
         val bitmap = themeIcons.peekCached(context, pkg) ?: return null
-        return BitmapDrawable(context.resources, bitmap).mutate()
+        return BitmapDrawable(context.resources, fittedArtwork(bitmap)).mutate()
+    }
+
+    /**
+     * Fits the artwork's opaque core to its frame, dropping a translucent outer glow.
+     *
+     * The theme engine wraps most themed icons in a soft glow. [ThemeIconProvider] counts any pixel
+     * above alpha 8 as content, so that glow becomes the outermost ring of the rendered square: the
+     * opaque artwork ends up inset by the glow's width, and the glow itself is stretched into a
+     * translucent rim. On the dock's dark rail a translucent rim reads as a paler outline around
+     * every icon, which is what "图标还是没有完全覆盖，旁边还是有阴影" and "四个角的颜色和别处
+     * 不一样" describe — and why the corner samples differ from the rest of the icon.
+     *
+     * Scaling the opaque box up to the full frame removes the rim and leaves the artwork flush with
+     * its cell, without adding a fill colour or changing the shape (re.14.1 was rejected for doing
+     * both). The cap keeps a genuinely inset design — a small glyph on a plate — from being blown up.
+     */
+    private fun fittedArtwork(source: Bitmap): Bitmap {
+        fitted.get(source)?.let { return it }
+        val width = source.width
+        val height = source.height
+        if (width <= 0 || height <= 0) return source
+        var left = width
+        var top = height
+        var right = -1
+        var bottom = -1
+        val pixels = IntArray(width * height)
+        runCatching { source.getPixels(pixels, 0, width, 0, 0, width, height) }.getOrNull()
+            ?: return source
+        for (y in 0 until height) {
+            val row = y * width
+            for (x in 0 until width) {
+                if ((pixels[row + x] ushr 24) < CORE_ALPHA) continue
+                if (x < left) left = x
+                if (x > right) right = x
+                if (y < top) top = y
+                if (y > bottom) bottom = y
+            }
+        }
+        if (right < left || bottom < top) return source
+        val coreWidth = right - left + 1
+        val coreHeight = bottom - top + 1
+        if (coreWidth >= width && coreHeight >= height) return source
+        val scale = maxOf(width.toFloat() / coreWidth, height.toFloat() / coreHeight)
+        if (scale - 1f > MAX_FIT_SCALE) return source
+        val result = runCatching {
+            val scaledWidth = coreWidth * scale
+            val scaledHeight = coreHeight * scale
+            val offsetX = (width - scaledWidth) / 2f
+            val offsetY = (height - scaledHeight) / 2f
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { target ->
+                Canvas(target).drawBitmap(
+                    source,
+                    Rect(left, top, right + 1, bottom + 1),
+                    RectF(offsetX, offsetY, offsetX + scaledWidth, offsetY + scaledHeight),
+                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG),
+                )
+            }
+        }.getOrNull() ?: return source
+        fitted.put(source, result)
+        return result
     }
 
     /**
@@ -206,5 +271,13 @@ internal class GameIconReplacer(
 
         /** Below this the resolved bitmap *is* the launcher icon, i.e. nothing was themed. */
         const val PLAIN_ARTWORK_TOLERANCE = 8.0
+
+        /** Alpha that counts as artwork rather than as the theme's outer glow. */
+        const val CORE_ALPHA = 128
+
+        /** Largest upscale [fittedArtwork] will apply before deciding this is not a glow at all. */
+        const val MAX_FIT_SCALE = 0.2f
+
+        const val MAX_CACHED_FITS = 64
     }
 }

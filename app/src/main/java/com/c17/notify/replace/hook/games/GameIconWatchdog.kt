@@ -185,6 +185,9 @@ internal object GameIconWatchdog {
             watched[icon] = Entry(drawable, plates)
         }
         icon.setImageDrawable(drawable)
+        // Dock cells only: dump the real colours once per process so the next report about the pale
+        // corners can be answered from the log instead of another guess.
+        if (clearPlate) GameSlotPixelProbe.probeOnce(icon, diagnostics)
         diagnostics.report(
             level = DiagnosticLevel.Debug,
             event = DiagnosticEvent.GameAssistantWatchdog,

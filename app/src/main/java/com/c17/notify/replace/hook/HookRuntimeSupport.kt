@@ -151,5 +151,9 @@ private val TRACED_EVENTS = setOf(
     DiagnosticEvent.GameAssistantHookResolved,
     DiagnosticEvent.GameAssistantCellBind,
     DiagnosticEvent.GameAssistantWatchdog,
+    // One line per process: the sampled colours of the dock artwork and of the layers behind it,
+    // which is the only way to tell "rim painted into the theme bitmap" apart from "host plate
+    // showing through the artwork's transparent corners".
+    DiagnosticEvent.GameAssistantSlotProbe,
     DiagnosticEvent.ThemeIconBlank,
 )
