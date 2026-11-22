@@ -93,18 +93,23 @@ internal class GameIconReplacer(
      * screen as a paler rim around a square. Masking to a circle reproduces what the panel looked
      * like before the dock moved the mask into Glide, and the glow falls outside the mask entirely.
      *
-     * Getting the *edge* right took three tries (2026-11-21 "上下左右都有一点点遮挡 不是正圆",
+     * Getting the *edge* right took five tries (2026-11-21 "上下左右都有一点点遮挡 不是正圆",
      * 2026-11-22 "能看到图标外围有个圈"):
      *
      * - A circle inscribed in the bitmap frame ([CIRCLE_FILL] = 1) sits exactly on the artwork's
-     *   outline, where the theme drew its rim/glow, so that rim becomes the circle's edge.
+     *   outline, where the theme drew its rim/glow, so that rim becomes the circle's edge — a pale,
+     *   uneven one.
      * - A circle fitted to the opaque box and then shrunk (0.95 of it) leaves a gap of panel
      *   colour all the way round, which reads as a ring around the icon.
+     * - Shrinking the mask slightly *and* scaling the artwork (0.97 of the frame) kept the rim
+     *   solid but left that same 3% gap, and the dock's own 1 dp icon outline — invisible under a
+     *   slot-filling icon — showed through it as a full ring.
      *
-     * So: scale the opaque core up to [CORE_FILL] of the frame first, pushing the theme's rim
-     * outside, then mask to [CIRCLE_FILL] of the frame. The circle ends up flush with the cell
-     * *and* its edge falls inside solid artwork rather than on the rim. Nothing is filled in and
-     * nothing is reshaped — the shape is still the host's CIRCLE.
+     * So the mask is the host's geometry again: a circle of [CIRCLE_FILL] = 1, i.e. exactly what
+     * the dock's own Glide pass (`oke.I` → `fj2`, radius = min(w, h) / 2) draws, with the opaque
+     * core blown up to [CORE_FILL] first so the theme's rim and glow are pushed outside and the
+     * edge falls in solid artwork. Leaving the slot uncovered is what exposes dock chrome, so
+     * nothing is left over on purpose; the outline itself is dropped by the icon watchdog.
      */
     private fun circularArtwork(source: Bitmap): Bitmap {
         circular.get(source)?.let { return it }
@@ -315,18 +320,17 @@ internal class GameIconReplacer(
         const val MAX_CACHED_MASKS = 64
 
         /**
-         * Circle diameter as a fraction of the frame. Just under 1: the cell view applies a round
-         * clip of its own (`COUIRoundImageView`), and a mask that lands exactly on it loses a pixel
-         * to the other clip. At 64 px this is about a pixel per side — invisible, but enough that
-         * nothing else can shave the outline.
+         * Circle diameter as a fraction of the frame: exactly the frame, which is the geometry the
+         * dock's own Glide circle uses. Anything smaller leaves a ring of panel colour — and of
+         * whatever the dock or the skin painted under the icon — around every icon.
          */
-        const val CIRCLE_FILL = 0.97f
+        const val CIRCLE_FILL = 1f
 
         /**
          * How much of the frame the artwork's opaque core is scaled to cover. Above 1 so the
          * theme's rim and glow are pushed outside the circle instead of becoming its edge.
          */
-        const val CORE_FILL = 1.02f
+        const val CORE_FILL = 1.05f
 
         /** Ceiling for the core scale-up, so a stray measurement cannot blow the glyph up. */
         const val MAX_CORE_SCALE = 1.4f

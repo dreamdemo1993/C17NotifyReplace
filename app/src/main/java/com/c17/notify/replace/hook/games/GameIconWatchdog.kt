@@ -1,6 +1,9 @@
 package com.c17.notify.replace.hook.games
 
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.RippleDrawable
+import android.view.View
+import android.view.ViewTreeObserver
 import android.widget.ImageView
 import com.c17.notify.replace.diagnostics.DiagnosticEvent
 import com.c17.notify.replace.diagnostics.DiagnosticLevel
@@ -32,15 +35,17 @@ import java.util.WeakHashMap
 internal object GameIconWatchdog {
 
     /**
-     * A backing this claim took off a view, kept so [release] can put it back.
+     * Chrome the claim took off a view, kept so [release] can put it back.
      *
-     * The dock lays a pale rounded square behind each app icon. Themed artwork is drawn *over* that
-     * plate rather than replacing it, so the plate shows through the artwork's transparent corners
-     * as a lighter rim (reported 2026-11-21: "没有完全覆盖，旁边还是有阴影"、"四个角的颜色和别处
-     * 不一样"). Where the plate lives is not fixed: the icon view itself on some builds, an
-     * icon-sized wrapper on others — hence a list of (view, drawable).
+     * The dock lays a pale plate *and* a 1 dp circle outline on each app icon slot; the skin layer
+     * then re-applies the outline after the cell is bound. Themed artwork is drawn over that chrome
+     * rather than replacing it, so a full-bleed icon hides it while anything smaller than the slot
+     * shows it: as pale corners behind a rounded square (reported 2026-11-21 "四个角的颜色和别处不
+     * 一样"), as a ring floating around the icon once the artwork became a circle (2026-11-22
+     * "能看到图标外围有个圈"). Where the chrome lives is not fixed: the icon view's own background on
+     * some builds, its foreground or an icon-sized wrapper on others — hence a list of views.
      */
-    private class Plate(val view: android.view.View, val background: Drawable)
+    private class Plate(val view: View, val background: Drawable?, val foreground: Drawable? = null)
 
     private class Entry(val expected: Drawable, val plates: List<Plate> = emptyList())
 
@@ -187,7 +192,12 @@ internal object GameIconWatchdog {
         icon.setImageDrawable(drawable)
         // Dock cells only: dump the real colours once per process so the next report about the pale
         // corners can be answered from the log instead of another guess.
-        if (clearPlate) GameSlotPixelProbe.probeOnce(icon, diagnostics)
+        if (clearPlate) {
+            GameSlotPixelProbe.probeOnce(icon, diagnostics)
+            installChromeSweep(icon)
+        } else {
+            dropChromeSweep(icon)
+        }
         diagnostics.report(
             level = DiagnosticLevel.Debug,
             event = DiagnosticEvent.GameAssistantWatchdog,
@@ -197,7 +207,10 @@ internal object GameIconWatchdog {
                 "view" to icon.javaClass.name,
                 "drawable" to drawable.javaClass.name,
                 "plates" to (synchronized(watched) { watched[icon]?.plates }
-                    ?.joinToString(">") { it.background.javaClass.simpleName }
+                    ?.joinToString(">") {
+                        "${it.background?.javaClass?.simpleName ?: "none"}" +
+                            "/${it.foreground?.javaClass?.simpleName ?: "none"}"
+                    }
                     ?.ifEmpty { "none" } ?: "none"),
                 // Only worth logging when nothing was found: it tells the next report whether the
                 // pale corners come from an ancestor this module never touched.
@@ -220,9 +233,12 @@ internal object GameIconWatchdog {
      */
     private fun takePlates(icon: ImageView): List<Plate> {
         val taken = ArrayList<Plate>(2)
-        icon.background?.let {
-            taken += Plate(icon, it)
+        val background = icon.background
+        val foreground = icon.foreground?.takeUnless { it is RippleDrawable }
+        if (background != null || foreground != null) {
+            taken += Plate(icon, background, foreground)
             icon.background = null
+            if (foreground != null) icon.foreground = null
         }
         if (icon.width <= 0 || icon.height <= 0) return taken
         var parent = icon.parent
@@ -247,21 +263,98 @@ internal object GameIconWatchdog {
     private fun ensurePlatesCleared(icon: ImageView) {
         val plates = synchronized(watched) { watched[icon]?.plates } ?: return
         for (plate in plates) {
-            if (plate.view.background != null) runCatching { plate.view.background = null }
+            if (plate.background != null && plate.view.background != null) {
+                runCatching { plate.view.background = null }
+            }
+            if (plate.foreground != null && plate.view.foreground != null) {
+                runCatching { plate.view.foreground = null }
+            }
         }
     }
 
-    /** `Class#bg@64x64<Class#none@64x64` for the claim's view and its ancestors. */
+    /** One live pre-draw sweep, with the observer it was registered on so it can be re-armed. */
+    private class Sweep(val owner: ViewTreeObserver, val listener: ViewTreeObserver.OnPreDrawListener)
+
+    private val sweeps = WeakHashMap<ImageView, Sweep>()
+
+    /**
+     * Keeps the dock's own chrome off a claimed icon for as long as the claim lives.
+     *
+     * Stripping it once at bind is not enough: the skin layer re-applies the icon's outline after
+     * the cell is bound (which is why the claim-time log reports `plates=none` while the ring is
+     * still on screen). A pre-draw pass is the cheapest place to win that race — it runs after the
+     * host has had its say and before the frame is painted, and with a claim the check is two field
+     * reads. A ripple foreground is left alone: it is press feedback, and its idle state paints
+     * nothing.
+     */
+    private fun installChromeSweep(icon: ImageView) {
+        val existing = synchronized(sweeps) { sweeps[icon] }
+        val observer = runCatching { icon.viewTreeObserver }.getOrNull()
+        if (existing != null && existing.owner === observer) return
+        if (observer == null || !observer.isAlive) return
+        // A recycled cell can come back attached to a different observer; the old registration is
+        // dead weight then, so it is dropped before the new one goes in.
+        if (existing != null) runCatching { existing.owner.removeOnPreDrawListener(existing.listener) }
+        val listener = ViewTreeObserver.OnPreDrawListener {
+            if (!isClaimed(icon)) {
+                dropChromeSweep(icon)
+            } else {
+                sweepChrome(icon)
+            }
+            true
+        }
+        synchronized(sweeps) { sweeps[icon] = Sweep(observer, listener) }
+        runCatching { observer.addOnPreDrawListener(listener) }
+    }
+
+    private fun dropChromeSweep(icon: ImageView) {
+        val sweep = synchronized(sweeps) { sweeps.remove(icon) } ?: return
+        runCatching { sweep.owner.removeOnPreDrawListener(sweep.listener) }
+    }
+
+    private fun isClaimed(icon: ImageView): Boolean = synchronized(watched) { watched[icon] != null }
+
+    /** Drops a plate or a skin outline re-applied to a claimed icon after bind. */
+    private fun sweepChrome(icon: ImageView) {
+        val background = icon.background
+        if (background != null) {
+            icon.background = null
+            traceChrome(icon, "background", background)
+        }
+        val foreground = icon.foreground
+        if (foreground != null && foreground !is RippleDrawable) {
+            icon.foreground = null
+            traceChrome(icon, "foreground", foreground)
+        }
+    }
+
+    private fun traceChrome(view: ImageView, kind: String, drawable: Drawable) {
+        diagnostics.report(
+            level = DiagnosticLevel.Info,
+            event = DiagnosticEvent.GameAssistantWatchdog,
+            message = "图标视图自带的底板/描边已摘除",
+            attributes = mapOf(
+                "stage" to "chrome",
+                "kind" to kind,
+                "view" to view.javaClass.simpleName,
+                "drawable" to drawable.javaClass.name,
+                "size" to "${view.width}x${view.height}",
+            ),
+            occurrence = OccurrencePolicy.Once("games:chrome:$kind:${drawable.javaClass.name}"),
+        )
+    }
+
+    /** `Class#bg/fg@64x64<Class#none/none@64x64` for the claim's view and its ancestors. */
     private fun describeChain(icon: ImageView): String {
         val parts = ArrayList<String>(PLATE_ANCESTOR_DEPTH + 1)
-        var next: android.view.View? = icon
+        var next: View? = icon
         var depth = 0
         while (depth <= PLATE_ANCESTOR_DEPTH) {
-            val current: android.view.View = next ?: break
-            val bg = current.background
-            parts += "${current.javaClass.simpleName}#${bg?.javaClass?.simpleName ?: "none"}" +
+            val current: View = next ?: break
+            parts += "${current.javaClass.simpleName}#${current.background?.javaClass?.simpleName ?: "none"}" +
+                "/${current.foreground?.javaClass?.simpleName ?: "none"}" +
                 "@${current.width}x${current.height}"
-            next = current.parent as? android.view.View
+            next = current.parent as? View
             depth++
         }
         return parts.joinToString("<")
@@ -277,9 +370,15 @@ internal object GameIconWatchdog {
             generationOf(icon).incrementAndGet()
             watched.remove(icon)?.plates
         }
+        dropChromeSweep(icon)
         // A recycled view that binds to a package without themed artwork must look like an
         // untouched dock cell, so the plates go back with the claim.
-        plates?.forEach { plate -> runCatching { plate.view.background = plate.background } }
+        plates?.forEach { plate ->
+            runCatching {
+                if (plate.background != null) plate.view.background = plate.background
+                if (plate.foreground != null) plate.view.foreground = plate.foreground
+            }
+        }
     }
 
     /** Marks the start of a background resolution; returns the generation token to fulfill with. */
