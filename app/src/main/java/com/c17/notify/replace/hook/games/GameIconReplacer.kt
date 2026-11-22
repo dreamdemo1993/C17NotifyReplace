@@ -93,17 +93,18 @@ internal class GameIconReplacer(
      * screen as a paler rim around a square. Masking to a circle reproduces what the panel looked
      * like before the dock moved the mask into Glide, and the glow falls outside the mask entirely.
      *
-     * Two details keep the outline clean (2026-11-21: "这个圆形有点奇怪 上下左右都有一点点遮挡
-     * 不是正圆"):
+     * Getting the *edge* right took three tries (2026-11-21 "上下左右都有一点点遮挡 不是正圆",
+     * 2026-11-22 "能看到图标外围有个圈"):
      *
-     * 1. The mask is sized from the artwork's **opaque** bounds, not from the bitmap's frame. The
-     *    theme renders into a fixed square with glow and padding around the glyph, so a circle
-     *    inscribed in the frame can be larger or smaller than the artwork itself and ends up
-     *    biting into its edge.
-     * 2. It is drawn at [CIRCLE_FILL] of that box, never touching it. The cell view
-     *    (`COUIRoundImageView`, and `CustomGameAppCellView` above it) applies its own round clip;
-     *    two masks of the same size shave a pixel off every side and the result no longer reads as
-     *    a circle. Pulling the mask in leaves that clip with nothing to cut.
+     * - A circle inscribed in the bitmap frame ([CIRCLE_FILL] = 1) sits exactly on the artwork's
+     *   outline, where the theme drew its rim/glow, so that rim becomes the circle's edge.
+     * - A circle fitted to the opaque box and then shrunk (0.95 of it) leaves a gap of panel
+     *   colour all the way round, which reads as a ring around the icon.
+     *
+     * So: scale the opaque core up to [CORE_FILL] of the frame first, pushing the theme's rim
+     * outside, then mask to [CIRCLE_FILL] of the frame. The circle ends up flush with the cell
+     * *and* its edge falls inside solid artwork rather than on the rim. Nothing is filled in and
+     * nothing is reshaped — the shape is still the host's CIRCLE.
      */
     private fun circularArtwork(source: Bitmap): Bitmap {
         circular.get(source)?.let { return it }
@@ -117,29 +118,25 @@ internal class GameIconReplacer(
                 android.graphics.Shader.TileMode.CLAMP,
             )
             val matrix = android.graphics.Matrix()
-            // 1:1, centred on the artwork rather than on the frame, so the circle wraps the glyph
-            // even when the theme left uneven padding inside the bitmap.
-            matrix.postTranslate(
-                (size - source.width) / 2f,
-                (size - source.height) / 2f,
-            )
+            val center = size / 2f
             if (core != null) {
+                val shortest = minOf(core.width(), core.height()).toFloat()
+                val scale = (size * CORE_FILL / shortest).coerceIn(1f, MAX_CORE_SCALE)
+                // p' = centre + scale * (p - coreCentre)
+                matrix.postTranslate(-core.exactCenterX(), -core.exactCenterY())
+                matrix.postScale(scale, scale)
+                matrix.postTranslate(center, center)
+            } else {
                 matrix.postTranslate(
-                    size / 2f - core.exactCenterX() - (size - source.width) / 2f,
-                    size / 2f - core.exactCenterY() - (size - source.height) / 2f,
+                    (size - source.width) / 2f,
+                    (size - source.height) / 2f,
                 )
             }
             shader.setLocalMatrix(matrix)
             val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
             paint.shader = shader
-            // A tiny opaque box means the measurement caught something odd rather than a glyph —
-            // half the frame is the floor, so a bad reading can never collapse the icon to a dot.
-            val box = (minOf(core?.width() ?: size, core?.height() ?: size)).toFloat()
-                .coerceAtLeast(size * MIN_CIRCLE_BOX)
-            val diameter = box * CIRCLE_FILL
             Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also { target ->
-                val center = size / 2f
-                Canvas(target).drawCircle(center, center, diameter / 2f, paint)
+                Canvas(target).drawCircle(center, center, center * CIRCLE_FILL, paint)
             }
         }.getOrNull() ?: return source
         circular.put(source, result)
@@ -318,18 +315,23 @@ internal class GameIconReplacer(
         const val MAX_CACHED_MASKS = 64
 
         /**
-         * Circle diameter as a fraction of the artwork's opaque box. Below 1 on purpose: a mask that
-         * touches the artwork's edge gets clipped a pixel or two further in by the cell view's own
-         * round mask (`COUIRoundImageView`), and the two combined stop reading as a circle. At a
-         * 64 px cell this leaves roughly 1.5 px of clearance per side — invisible, but enough that
+         * Circle diameter as a fraction of the frame. Just under 1: the cell view applies a round
+         * clip of its own (`COUIRoundImageView`), and a mask that lands exactly on it loses a pixel
+         * to the other clip. At 64 px this is about a pixel per side — invisible, but enough that
          * nothing else can shave the outline.
          */
-        const val CIRCLE_FILL = 0.95f
+        const val CIRCLE_FILL = 0.97f
 
-        /** Alpha that counts as artwork rather than as the theme's soft outer glow. */
-        const val CORE_ALPHA = 128
+        /**
+         * How much of the frame the artwork's opaque core is scaled to cover. Above 1 so the
+         * theme's rim and glow are pushed outside the circle instead of becoming its edge.
+         */
+        const val CORE_FILL = 1.02f
 
-        /** Smallest opaque box, as a fraction of the frame, that the circle will be fitted to. */
-        const val MIN_CIRCLE_BOX = 0.5f
+        /** Ceiling for the core scale-up, so a stray measurement cannot blow the glyph up. */
+        const val MAX_CORE_SCALE = 1.4f
+
+        /** Alpha that counts as artwork rather than as the theme's soft outer glow or rim. */
+        const val CORE_ALPHA = 160
     }
 }
